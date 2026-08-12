@@ -1,0 +1,773 @@
+#!/usr/bin/env python3
+"""advect — generative flow-field wallpapers, straight from the void.
+
+Thousands of particles trace a layered noise field into a painting. Every run
+is unique (or use --seed to reproduce one). Stdlib only, writes real PNGs.
+
+  advect                    # render to ~/Pictures/advect/, print path
+  advect --set              # render AND set as desktop wallpaper
+  advect --palette ember    # harbor | ember | moss | dune
+  advect --seed 7 --size 2016x1310
+  advect --sharp 0.7 --glow 0.9 --softness 1.5   # crisper lines, brighter, softer glow
+  advect --dynamic --set    # a Dynamic .heic that shifts with the time of day
+  advect --dynamic --frames 32   # more frames = subtler, more continuous drift
+  advect --backend c        # compiled march via cc + ctypes: same seed, ~25x faster
+  advect --backend gpu      # MLX on Apple Silicon (best at native/--dynamic scale)
+  advect --out ~/wall.png   # write here instead of ~/Pictures/advect/
+  advect --progress         # one JSON event per line on stderr, for a GUI host
+  advect --preview /tmp/p.png    # keep a small live snapshot of the painting there
+
+Dynamic mode interpolates the MOODS journey into many frames sharing one seed, so
+the geometry is frozen and only colour/light drift — subtle, continuous change.
+
+Backends produce the same geometry for a given seed (the diffuse glow layer may
+differ by <1 level under GPU's parallel accumulation). Stdlib only for --backend
+py/c; gpu needs mlx.
+"""
+
+import json
+import math
+import os
+import random
+import struct
+import subprocess
+import sys
+import time
+import zlib
+from array import array
+
+PALETTES = {
+    # bg, stroke colors (particles pick by the field's own noise value).
+    # The look is glowing lightning filaments on a DARK background — every palette
+    # keeps a near-black ground so the colour blazes. Only the hue shifts by hour.
+    "harbor": ((20, 10, 12), [(255, 72, 58), (220, 40, 50), (255, 132, 108), (150, 44, 62)]),       # red — night filaments blaze
+    "ember": ((24, 15, 18), [(242, 149, 68), (214, 78, 60), (255, 209, 102), (120, 60, 80)]),       # orange — dawn/dusk fire
+    "moss": ((18, 26, 20), [(126, 168, 90), (214, 205, 154), (58, 110, 92), (240, 244, 235)]),      # green — afternoon
+    "dune": ((16, 24, 33), [(63, 191, 188), (208, 178, 125), (94, 129, 172), (233, 236, 239)]),     # teal — morning, dark bg
+}
+
+# A day in one flow field: same seed → identical geometry, only the light shifts.
+# (palette, time-of-day 0=midnight..1, glow, softness). glow stays >0 so the
+# stroke geometry (which depends on the glow codepath) is identical every frame.
+DAY_CYCLE = [
+    ("harbor", 0.00, 1.10, 1.4),   # deep night — red filaments blaze in the dark
+    ("harbor", 0.18, 0.80, 1.3),   # small hours
+    ("ember",  0.28, 0.65, 1.1),   # dawn — fire orange
+    ("dune",   0.40, 0.45, 1.0),   # morning — teal
+    ("dune",   0.50, 0.30, 1.0),   # midday — teal, glow recedes
+    ("moss",   0.63, 0.50, 1.1),   # afternoon green
+    ("ember",  0.78, 0.95, 1.3),   # sunset orange
+    ("harbor", 0.90, 1.05, 1.4),   # nightfall red
+]
+
+# A richer 24h journey of "moods" — (time 0=midnight..1, palette, glow, softness).
+# render_dynamic interpolates BETWEEN these into many frames, so colour and light
+# only ever drift; the seed is fixed so the geometry never moves. The result is a
+# wallpaper that is subtly, continuously changing rather than snapping between looks.
+MOODS = [
+    (0.00, "harbor", 1.05, 1.40),   # deep night — red filaments in the dark
+    (0.16, "harbor", 0.80, 1.30),   # small hours, dimming
+    (0.27, "ember",  0.66, 1.15),   # first fire before dawn
+    (0.36, "ember",  0.52, 1.05),   # dawn — orange
+    (0.45, "dune",   0.40, 1.00),   # morning — teal
+    (0.52, "dune",   0.26, 1.00),   # midday — teal, glow recedes
+    (0.62, "moss",   0.44, 1.05),   # early afternoon green
+    (0.72, "moss",   0.60, 1.12),   # afternoon deepens
+    (0.81, "ember",  0.92, 1.25),   # sunset orange
+    (0.90, "ember",  1.06, 1.35),   # dusk, glow returns
+]
+
+
+def _lerp(a, b, u):
+    return a + (b - a) * u
+
+def _smooth(u):
+    return u * u * (3 - 2 * u)                      # ease-in-out so drifts are gentle
+
+def day_look(t):
+    """Interpolate the MOODS journey at time-of-day t∈[0,1) → (palette, glow, softness),
+    where palette is an explicit (bg, colors) blended between the two nearest moods."""
+    anchors = MOODS + [(MOODS[0][0] + 1.0,) + tuple(MOODS[0][1:])]   # wrap past midnight
+    for (t0, p0, g0, s0), (t1, p1, g1, s1) in zip(anchors, anchors[1:]):
+        if t0 <= t < t1:
+            u = _smooth((t - t0) / (t1 - t0))
+            (bg0, c0), (bg1, c1) = PALETTES[p0], PALETTES[p1]
+            bg = tuple(int(round(_lerp(bg0[k], bg1[k], u))) for k in range(3))
+            cols = [tuple(int(round(_lerp(a[k], b[k], u)) ) for k in range(3))
+                    for a, b in zip(c0, c1)]
+            return (bg, cols), _lerp(g0, g1, u), _lerp(s0, s1, u)
+    bg, cols = PALETTES[MOODS[0][1]]                 # t==0 fallthrough
+    return (bg, cols), MOODS[0][2], MOODS[0][3]
+
+
+class Noise:
+    """Value noise + fBm. Smooth enough for flow fields, tiny enough to read."""
+
+    def __init__(self, rng, cell=160.0):
+        self.g = [[rng.random() for _ in range(64)] for _ in range(64)]
+        self.cell = cell
+
+    def raw(self, x, y):
+        gx, gy = x / self.cell, y / self.cell
+        ix, iy = int(gx) & 63, int(gy) & 63
+        fx, fy = gx - int(gx), gy - int(gy)
+        sx, sy = fx * fx * (3 - 2 * fx), fy * fy * (3 - 2 * fy)
+        g = self.g
+        a, b = g[iy][ix], g[iy][(ix + 1) & 63]
+        c, d = g[(iy + 1) & 63][ix], g[(iy + 1) & 63][(ix + 1) & 63]
+        return a + (b - a) * sx + (c - a) * sy + (a - b - c + d) * sx * sy
+
+    def fbm(self, x, y):
+        return (self.raw(x, y) * 0.5
+                + self.raw(x * 2.1 + 31, y * 2.1 + 57) * 0.3
+                + self.raw(x * 4.3 + 89, y * 4.3 + 13) * 0.2)
+
+
+def box_blur(a, w, h, r, passes=2):
+    """Separable clamped-edge box blur over a single-channel float array, in place.
+
+    Cheap diffusion for the light layer — a couple of passes fake a Gaussian.
+    """
+    win = 2 * r + 1
+    tmp = array("f", bytes(4 * len(a)))
+    for _ in range(passes):
+        for y in range(h):                                   # horizontal → tmp
+            row = y * w
+            s = sum(a[row + max(0, min(w - 1, k))] for k in range(-r, r + 1))
+            for x in range(w):
+                tmp[row + x] = s / win
+                s -= a[row + max(0, x - r)]
+                s += a[row + min(w - 1, x + r + 1)]
+        for x in range(w):                                   # vertical → a
+            s = sum(tmp[max(0, min(h - 1, k)) * w + x] for k in range(-r, r + 1))
+            for y in range(h):
+                a[y * w + x] = s / win
+                s -= tmp[max(0, y - r) * w + x]
+                s += tmp[min(h - 1, y + r + 1) * w + x]
+
+
+DENSITY = 105      # one stroke per DENSITY pixels — lower = denser, less empty ground
+STROKE_LEN = 1.05  # steps ≈ STROKE_LEN * max(w, h): long enough to leave the frame
+
+DENSITY_REF = 105   # the DENSITY the deposit levels below are tuned against
+DEPOSIT_EXP = 0.85  # per-stroke deposit scales by (DENSITY/REF)**EXP, so going denser
+                    # fills the empty ground without inflating the bright ridges
+FIELD_FREQ = 1.0    # spatial frequency of the flow field; >1 = smaller cells, fewer big voids
+
+def n_particles(w, h):
+    return max(w * h // DENSITY, 800)              # constant stroke density at any size
+
+def deposit_scale():
+    return (DENSITY / DENSITY_REF) ** DEPOSIT_EXP
+
+def stroke_plan(w, h):
+    """How far a stroke travels, and a per-step taper. The taper is a smoothstep
+    envelope: brightness holds at full for most of the stroke, then eases off
+    gently at the very ends — no hard stop, no quick linear drop. Shared by every
+    backend for exact parity."""
+    steps = max(int(max(w, h) * STROKE_LEN), 320)
+    fin = max(1, int(steps * 0.03))                 # brief ease-in
+    fout = max(1, int(steps * 0.16))                # long, gentle ease-out tail
+    def ease(x):
+        x = x if x < 1.0 else 1.0
+        return x * x * (3 - 2 * x)
+    tw = array("d", bytes(8 * steps))
+    for s in range(steps):
+        tw[s] = ease((s + 1) / fin) * ease((steps - s) / fout)
+    return steps, tw
+
+
+def composite_glow(buf, light, glow, lw, lh, DS, w, h):
+    """Bilinearly upsample the blurred light grid and clamp-add it over the image
+    (matches fp_composite in C) — smooth glow, no DS-block pixelation."""
+    for y in range(h):
+        gy = (y + 0.5) / DS - 0.5
+        ly0 = math.floor(gy); ty = gy - ly0
+        cy0 = min(max(ly0, 0), lh - 1); cy1 = min(max(ly0 + 1, 0), lh - 1)
+        for x in range(w):
+            gx = (x + 0.5) / DS - 0.5
+            lx0 = math.floor(gx); tx = gx - lx0
+            cx0 = min(max(lx0, 0), lw - 1); cx1 = min(max(lx0 + 1, 0), lw - 1)
+            w00 = (1 - tx) * (1 - ty); w01 = tx * (1 - ty)
+            w10 = (1 - tx) * ty;       w11 = tx * ty
+            i00 = (cy0 * lw + cx0) * 3; i01 = (cy0 * lw + cx1) * 3
+            i10 = (cy1 * lw + cx0) * 3; i11 = (cy1 * lw + cx1) * 3
+            o = (y * w + x) * 3
+            for c in range(3):
+                lv = (light[i00 + c] * w00 + light[i01 + c] * w01
+                      + light[i10 + c] * w10 + light[i11 + c] * w11)
+                v = buf[o + c] + lv * glow
+                buf[o + c] = 255 if v > 255 else int(v)
+
+
+def write_png(path, w, h, rgb):
+    def chunk(tag, data):
+        payload = tag + data
+        return struct.pack(">I", len(data)) + payload + struct.pack(">I", zlib.crc32(payload))
+
+    raw = b"".join(b"\x00" + bytes(rgb[y * w * 3 : (y + 1) * w * 3]) for y in range(h))
+    with open(path, "wb") as f:
+        f.write(b"\x89PNG\r\n\x1a\n")
+        f.write(chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)))
+        f.write(chunk(b"IDAT", zlib.compress(raw, 6)))
+        f.write(chunk(b"IEND", b""))
+
+
+def downscale(buf, w, h, maxw):
+    """Nearest-neighbour sample down to at most `maxw` wide.
+
+    Only used for live preview snapshots, where it beats a proper box filter on
+    the one axis that matters: it has to be cheap enough to run mid-paint without
+    stealing time from the render.
+    """
+    if w <= maxw:
+        return w, h, buf
+    dw = maxw
+    dh = max(1, h * dw // w)
+    xs = [(x * w // dw) * 3 for x in range(dw)]
+    out = b"".join(
+        b"".join(buf[r + o : r + o + 3] for o in xs)
+        for r in ((y * h // dh) * w * 3 for y in range(dh))
+    )
+    return dw, dh, out
+
+
+class Progress:
+    """Machine-readable progress and live preview snapshots, for a GUI host.
+
+    Entirely off by default — without --progress/--preview the script prints
+    exactly what it always has. With them, every event is one JSON object per
+    line on stderr (stdout stays the human/paths channel), and the painting is
+    periodically dumped to a small PNG the host can display while it renders.
+    """
+
+    PREVIEW_WIDTH = 640
+
+    def __init__(self):
+        self.on = False
+        self.preview_path = None
+        self.interval = 1.0
+        self.frame, self.frames = 0, 1
+        self._last = 0.0
+        self._seq = 0
+
+    @property
+    def active(self):
+        return self.on or self.preview_path
+
+    def event(self, phase, **kw):
+        if not self.on:
+            return
+        kw["phase"] = phase
+        if self.frames > 1:
+            kw.setdefault("frame", self.frame)
+            kw.setdefault("frames", self.frames)
+        sys.stderr.write(json.dumps(kw) + "\n")
+        sys.stderr.flush()
+
+    def overall(self, pct):
+        """Paint percentage of this frame folded into percentage of the whole job."""
+        return (self.frame * 100 + pct) / self.frames
+
+    def paint(self, pct, buf=None, w=0, h=0):
+        """Report paint progress, and snapshot the canvas if enough time has passed."""
+        if not self.active:
+            return
+        self.event("paint", pct=pct, overall=round(self.overall(pct), 1))
+        if buf is not None and self.preview_path and time.time() - self._last >= self.interval:
+            self.snapshot(buf, w, h)
+
+    def snapshot(self, buf, w, h):
+        """Write the current canvas to the preview path atomically, so a host
+        reading it concurrently never sees a half-written PNG."""
+        if not self.preview_path:
+            return
+        self._last = time.time()
+        try:
+            dw, dh, small = downscale(buf, w, h, self.PREVIEW_WIDTH)
+            tmp = self.preview_path + ".tmp"
+            write_png(tmp, dw, dh, small)
+            os.replace(tmp, self.preview_path)
+        except OSError:
+            return                                   # a preview is never worth failing over
+        self._seq += 1
+        self.event("preview", path=self.preview_path, seq=self._seq)
+
+    def say(self, text):
+        """Human progress line — suppressed when a host is parsing us instead."""
+        if not self.on:
+            print(text, end="", flush=True)
+
+
+UI = Progress()
+
+
+def display_size():
+    try:
+        out = subprocess.run(["system_profiler", "SPDisplaysDataType"],
+                             capture_output=True, text=True, timeout=10).stdout
+        for line in out.splitlines():
+            if "Resolution:" in line:
+                parts = line.split()
+                w, h = int(parts[1]), int(parts[3])
+                return min(w, 3840), min(h, 2560)  # render at native resolution (Retina-sharp)
+    except Exception:
+        pass
+    return 3456, 2234
+
+
+LIGHT_K = 0.004   # energy a diffuse stroke emits per step into the light layer
+ALPHA = 0.13      # sharp-stroke opacity; lower = thinner, less-bloated bright cores
+
+
+def render(w, h, seed, palette, sharp=0.6, glow=0.7, softness=1.0, backend="py"):
+    if backend != "py":
+        return render_accel(backend, w, h, seed, palette, sharp, glow, softness)
+    rng = random.Random(seed)
+    bg, colors = palette if isinstance(palette, tuple) else PALETTES[palette]
+    field = Noise(rng, cell=max(w, h) / (rng.uniform(4.5, 7.5) * FIELD_FREQ))
+    band = Noise(rng, cell=max(w, h) / 3.0)
+
+    buf = bytearray(w * h * 3)
+    for i in range(0, len(buf), 3):
+        buf[i], buf[i + 1], buf[i + 2] = bg
+
+    # Diffuse strokes accumulate onto a coarse light grid that we blur and add
+    # back as soft glow — cheap "light transfer". Sharp strokes paint crisp,
+    # anti-aliased lines straight into the image.
+    use_glow = glow > 0 and sharp < 1.0
+    DS = 3
+    lw, lh = (w + DS - 1) // DS, (h + DS - 1) // DS
+    light = array("f", bytes(4 * lw * lh * 3)) if use_glow else None
+
+    n_parts = n_particles(w, h)
+    steps, tw = stroke_plan(w, h)          # longer strokes, tapered at both ends
+    dep = deposit_scale()                    # density-compensate the per-stroke deposit
+    alpha = ALPHA * dep                      # sharp strokes read crisp and defined
+    lk = LIGHT_K * dep
+    twist = rng.uniform(2.5, 4.5) * math.pi
+
+    t0 = time.time()
+    for p in range(n_parts):
+        x, y = rng.uniform(0, w), rng.uniform(0, h)
+        cr, cg, cb = colors[min(int(band.fbm(x, y) * len(colors) * 1.35), len(colors) - 1)]
+        if use_glow and rng.random() >= sharp:
+            er, eg, eb = cr * lk, cg * lk, cb * lk   # diffuse: emit light
+            for s in range(steps):
+                theta = field.fbm(x, y) * twist
+                x += math.cos(theta) * 1.6
+                y += math.sin(theta) * 1.6
+                if not (1 <= x < w - 1 and 1 <= y < h - 1):
+                    break
+                e = tw[s]
+                li = ((int(y) // DS) * lw + int(x) // DS) * 3
+                light[li] += er * e; light[li + 1] += eg * e; light[li + 2] += eb * e
+        else:
+            thick = rng.random() < 0.18   # a few bold strokes over many fine ones
+            a = alpha * (1.5 if thick else 1.0)
+            for s in range(steps):
+                theta = field.fbm(x, y) * twist
+                x += math.cos(theta) * 1.6
+                y += math.sin(theta) * 1.6
+                if not (1 <= x < w - 1 and 1 <= y < h - 1):
+                    break
+                at = a * tw[s]
+                x0, y0 = int(x), int(y)
+                fx, fy = x - x0, y - y0
+                for dx, dy, wt in ((0, 0, (1 - fx) * (1 - fy)), (1, 0, fx * (1 - fy)),
+                                   (0, 1, (1 - fx) * fy), (1, 1, fx * fy)):   # bilinear = smooth, sharp lines
+                    i = ((y0 + dy) * w + (x0 + dx)) * 3
+                    aw = at * wt
+                    buf[i] = int(buf[i] + (cr - buf[i]) * aw)
+                    buf[i + 1] = int(buf[i + 1] + (cg - buf[i + 1]) * aw)
+                    buf[i + 2] = int(buf[i + 2] + (cb - buf[i + 2]) * aw)
+        if p % 260 == 0:
+            pct = 100 * p // n_parts
+            UI.say(f"\rpainting… {pct}%")
+            UI.paint(pct, buf, w, h)
+
+    if use_glow:                              # blur the light layer, add it back
+        UI.say("\rdiffusing light…        ")
+        UI.event("light")
+        r = max(1, round(3 * softness))
+        for c in range(3):
+            ch = light[c::3]
+            box_blur(ch, lw, lh, r)
+            light[c::3] = ch
+        composite_glow(buf, light, glow, lw, lh, DS, w, h)
+    UI.say(f"\rpainted in {time.time()-t0:.1f}s      \n")
+    UI.paint(100)
+    UI.snapshot(buf, w, h)
+    return buf
+
+
+# ── accelerated backends ───────────────────────────────────────────────────
+# Python owns every rng draw (grids, twist, per-particle spec) so seeds stay
+# bit-reproducible; the C / GPU kernels only do the hot march + splat + glow.
+
+def build_scene(w, h, seed, palette, sharp, glow):
+    """Reproduce render()'s exact rng sequence, but emit the per-particle spec
+    as flat arrays instead of marching. Returns everything a kernel needs."""
+    rng = random.Random(seed)
+    bg, colors = palette if isinstance(palette, tuple) else PALETTES[palette]
+    field = Noise(rng, cell=max(w, h) / (rng.uniform(4.5, 7.5) * FIELD_FREQ))
+    band = Noise(rng, cell=max(w, h) / 3.0)
+
+    buf = bytearray(bytes(bg) * (w * h))     # C-level bg fill
+
+    use_glow = glow > 0 and sharp < 1.0
+    DS = 3
+    lw, lh = (w + DS - 1) // DS, (h + DS - 1) // DS
+
+    n_parts = n_particles(w, h)
+    steps, tw = stroke_plan(w, h)
+    alpha = ALPHA * deposit_scale()
+    twist = rng.uniform(2.5, 4.5) * math.pi
+
+    px, py = array("d", bytes(8 * n_parts)), array("d", bytes(8 * n_parts))
+    palpha = array("d", bytes(8 * n_parts))
+    pmode = bytearray(n_parts)
+    pcol = bytearray(n_parts * 3)
+    for p in range(n_parts):
+        x, y = rng.uniform(0, w), rng.uniform(0, h)
+        cr, cg, cb = colors[min(int(band.fbm(x, y) * len(colors) * 1.35), len(colors) - 1)]
+        if use_glow and rng.random() >= sharp:
+            pmode[p] = 1                                     # diffuse
+        else:
+            thick = rng.random() < 0.18                      # sharp
+            palpha[p] = alpha * (1.5 if thick else 1.0)
+        px[p], py[p] = x, y
+        pcol[p * 3], pcol[p * 3 + 1], pcol[p * 3 + 2] = cr, cg, cb
+
+    fieldg = array("d", (v for row in field.g for v in row))
+    return dict(fieldg=fieldg, cell=field.cell, twist=twist, w=w, h=h,
+                px=px, py=py, pmode=pmode, palpha=palpha, pcol=pcol,
+                n=n_parts, steps=steps, tw=tw, buf=buf,
+                use_glow=use_glow, DS=DS, lw=lw, lh=lh)
+
+
+_CLIB = None
+
+def _load_clib():
+    """Compile advect_accel.c on demand (cached by source mtime) and load it."""
+    global _CLIB
+    if _CLIB is not None:
+        return _CLIB
+    import ctypes
+    src = os.path.join(os.path.dirname(os.path.realpath(__file__)), "advect_accel.c")
+    cache = os.path.expanduser("~/.cache/advect")
+    os.makedirs(cache, exist_ok=True)
+    so = os.path.join(cache, "accel.so")
+    if not os.path.exists(so) or os.path.getmtime(so) < os.path.getmtime(src):
+        print("compiling C backend…", end="", flush=True)
+        r = subprocess.run(["cc", "-O3", "-shared", "-fPIC", "-o", so, src],
+                           capture_output=True, text=True)
+        if r.returncode:
+            sys.exit("\nC backend failed to compile:\n" + r.stderr)
+        print("\r                    \r", end="")
+    lib = ctypes.CDLL(so)
+    d, u8, f32 = ctypes.POINTER(ctypes.c_double), ctypes.POINTER(ctypes.c_uint8), ctypes.POINTER(ctypes.c_float)
+    lib.fp_march.argtypes = [d, ctypes.c_double, ctypes.c_double, ctypes.c_int, ctypes.c_int,
+                             d, d, u8, d, u8, ctypes.c_int, ctypes.c_int, d, u8,
+                             ctypes.c_int, f32, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_double]
+    lib.fp_composite.argtypes = [u8, f32, ctypes.c_double, ctypes.c_int, ctypes.c_int,
+                                 ctypes.c_int, ctypes.c_int, ctypes.c_int]
+    _CLIB = lib
+    return lib
+
+
+def _ptr(buf, ctype):
+    import ctypes
+    return (ctype * (len(buf) if isinstance(buf, (bytearray, bytes)) else len(buf))).from_buffer(buf)
+
+
+def _off(arr, ctype, i):
+    """A pointer to element i of an existing ctypes array. Lets us hand fp_march a
+    slice of the particle list without copying it, so a march can be run in chunks
+    (for progress and live preview) while staying bit-identical to one big call —
+    the kernel keeps no state between particles and still walks them in order."""
+    import ctypes
+    return ctypes.cast(ctypes.byref(arr, i * ctypes.sizeof(ctype)),
+                       ctypes.POINTER(ctype))
+
+
+def _march_chunked(lib, sc, px, py, pmode, palpha, pcol, n, buf, light, label):
+    """Run fp_march over `n` particles in chunks, reporting progress between them."""
+    import ctypes
+    fieldg = _ptr(sc["fieldg"], ctypes.c_double)
+    tw = _ptr(sc["tw"], ctypes.c_double)
+    cbuf = _ptr(buf, ctypes.c_uint8)
+    clight = _ptr(light, ctypes.c_float) if light is not None else None
+    use_glow = 1 if light is not None else 0
+    lk = LIGHT_K * deposit_scale()
+    step = max(1, -(-n // 48)) if UI.active else n        # one call when nobody is watching
+    done = 0
+    while done < n:
+        m = min(step, n - done)
+        lib.fp_march(fieldg, sc["cell"], sc["twist"], sc["w"], sc["h"],
+                     _off(px, ctypes.c_double, done), _off(py, ctypes.c_double, done),
+                     _off(pmode, ctypes.c_uint8, done), _off(palpha, ctypes.c_double, done),
+                     _off(pcol, ctypes.c_uint8, done * 3), m, sc["steps"], tw,
+                     cbuf, use_glow, clight,
+                     sc["lw"], sc["lh"], sc["DS"], lk)
+        done += m
+        pct = 100 * done // n
+        UI.say(f"\rpainting ({label})… {pct}%")
+        UI.paint(pct, buf, sc["w"], sc["h"])
+
+
+def render_c(sc, glow, softness):
+    import ctypes
+    lib = _load_clib()
+    buf, light = sc["buf"], None
+    if sc["use_glow"]:
+        light = array("f", bytes(4 * sc["lw"] * sc["lh"] * 3))
+    t0 = time.time()
+    UI.say("painting (C)…")
+    _march_chunked(lib, sc, _ptr(sc["px"], ctypes.c_double), _ptr(sc["py"], ctypes.c_double),
+                   _ptr(sc["pmode"], ctypes.c_uint8), _ptr(sc["palpha"], ctypes.c_double),
+                   _ptr(sc["pcol"], ctypes.c_uint8), sc["n"], buf, light, "C")
+    if sc["use_glow"]:
+        UI.say("\rdiffusing light…        ")
+        UI.event("light")
+        r = max(1, round(3 * softness))
+        for c in range(3):
+            ch = light[c::3]
+            box_blur(ch, sc["lw"], sc["lh"], r)
+            light[c::3] = ch
+        lib.fp_composite(_ptr(buf, ctypes.c_uint8), _ptr(light, ctypes.c_float), glow,
+                         sc["lw"], sc["lh"], sc["DS"], sc["w"], sc["h"])
+    UI.say(f"\rpainted in {time.time()-t0:.1f}s  (C)      \n")
+    UI.paint(100)
+    UI.snapshot(buf, sc["w"], sc["h"])
+    return buf
+
+
+def _gpu_diffuse_light(sc):
+    """March the diffuse particles on the GPU (MLX) and scatter their emitted
+    energy into the light grid. Order-independent additive accumulation → a
+    legitimate parallel reduction. float32 (Metal has no f64), so filaments
+    diverge slightly from the f64 reference over many steps — same look, blurred
+    anyway. Returns a flat array('f') light grid, or None if no diffuse strokes."""
+    import mlx.core as mx
+    pmode, px, py, pcol = sc["pmode"], sc["px"], sc["py"], sc["pcol"]
+    idx = [i for i in range(sc["n"]) if pmode[i]]
+    if not idx:
+        return None
+    w, h, DS, lw, lh = sc["w"], sc["h"], sc["DS"], sc["lw"], sc["lh"]
+    x = mx.array([px[i] for i in idx], dtype=mx.float32)
+    y = mx.array([py[i] for i in idx], dtype=mx.float32)
+    lk = LIGHT_K * deposit_scale()
+    er = mx.array([[pcol[i * 3] * lk, pcol[i * 3 + 1] * lk,
+                    pcol[i * 3 + 2] * lk] for i in idx], dtype=mx.float32)
+    g = mx.array(list(sc["fieldg"]), dtype=mx.float32).reshape(64, 64)
+    cell, twist = float(sc["cell"]), float(sc["twist"])
+
+    def fbm(x, y):
+        def raw(x, y):
+            gx, gy = x / cell, y / cell
+            ix, iy = gx.astype(mx.int32) & 63, gy.astype(mx.int32) & 63
+            fx, fy = gx - mx.floor(gx), gy - mx.floor(gy)
+            sx, sy = fx * fx * (3 - 2 * fx), fy * fy * (3 - 2 * fy)
+            ix1, iy1 = (ix + 1) & 63, (iy + 1) & 63
+            a, b = g[iy, ix], g[iy, ix1]
+            c, d = g[iy1, ix], g[iy1, ix1]
+            return a + (b - a) * sx + (c - a) * sy + (a - b - c + d) * sx * sy
+        return raw(x, y) * 0.5 + raw(x * 2.1 + 31, y * 2.1 + 57) * 0.3 \
+                              + raw(x * 4.3 + 89, y * 4.3 + 13) * 0.2
+
+    tw = sc["tw"]
+    light = mx.zeros((lw * lh, 3))
+    alive = mx.ones(len(idx), dtype=mx.bool_)
+    for s in range(sc["steps"]):
+        theta = fbm(x, y) * twist
+        nx, ny = x + mx.cos(theta) * 1.6, y + mx.sin(theta) * 1.6
+        inb = (nx >= 1) & (nx < w - 1) & (ny >= 1) & (ny < h - 1)
+        alive = alive & inb                       # step that leaves bounds doesn't count
+        x, y = mx.where(alive, nx, x), mx.where(alive, ny, y)
+        cell_idx = (y.astype(mx.int32) // DS) * lw + x.astype(mx.int32) // DS
+        light = light.at[cell_idx].add(er * (alive.astype(mx.float32) * tw[s])[:, None])
+        if s % 64 == 0:
+            mx.eval(light, x, y, alive)
+            pct = 100 * s // sc["steps"]
+            UI.say(f"\rmarching light (GPU)… {pct}%")
+            UI.event("glow", pct=pct)
+    mx.eval(light)
+    return array("f", memoryview(light.reshape(-1)))
+
+
+def render_gpu(sc, glow, softness):
+    import ctypes
+    lib = _load_clib()
+    buf = sc["buf"]
+    n, pmode = sc["n"], sc["pmode"]
+    t0 = time.time()
+    UI.say("painting (GPU)…")
+
+    # sharp strokes: exact, ordered alpha-blend on the C backend (diffuse skipped)
+    sidx = [i for i in range(n) if pmode[i] == 0]
+    if sidx:
+        px, py, palpha, pcol = sc["px"], sc["py"], sc["palpha"], sc["pcol"]
+        sx = array("d", (px[i] for i in sidx))
+        sy = array("d", (py[i] for i in sidx))
+        sal = array("d", (palpha[i] for i in sidx))
+        smode = bytearray(len(sidx))              # all sharp
+        scol = bytearray()
+        for i in sidx:
+            scol += pcol[i * 3:i * 3 + 3]
+        _march_chunked(lib, sc, _ptr(sx, ctypes.c_double), _ptr(sy, ctypes.c_double),
+                       _ptr(smode, ctypes.c_uint8), _ptr(sal, ctypes.c_double),
+                       _ptr(scol, ctypes.c_uint8), len(sidx), buf, None, "GPU")
+
+    # diffuse glow: parallel march + scatter on the GPU
+    if sc["use_glow"]:
+        light = _gpu_diffuse_light(sc)
+        if light is not None:
+            UI.say("\rdiffusing light…        ")
+            UI.event("light")
+            r = max(1, round(3 * softness))
+            for c in range(3):
+                ch = light[c::3]
+                box_blur(ch, sc["lw"], sc["lh"], r)
+                light[c::3] = ch
+            lib.fp_composite(_ptr(buf, ctypes.c_uint8), _ptr(light, ctypes.c_float), glow,
+                             sc["lw"], sc["lh"], sc["DS"], sc["w"], sc["h"])
+    UI.say(f"\rpainted in {time.time()-t0:.1f}s  (GPU)      \n")
+    UI.paint(100)
+    UI.snapshot(buf, sc["w"], sc["h"])
+    return buf
+
+
+def render_accel(backend, w, h, seed, palette, sharp, glow, softness):
+    sc = build_scene(w, h, seed, palette, sharp, glow)
+    if backend == "c":
+        return render_c(sc, glow, softness)
+    if backend == "gpu":
+        return render_gpu(sc, glow, softness)
+    sys.exit(f"unknown backend {backend!r}; pick from py, c, gpu")
+
+
+def build_dynamic_xmp(times, light_idx, dark_idx):
+    """XMP packet carrying Apple's `h24` time schedule (base64 binary plist)."""
+    import base64
+    import plistlib
+    pl = {"ti": [{"t": float(t), "i": i} for i, t in enumerate(times)],
+          "ap": {"l": light_idx, "d": dark_idx}}
+    b64 = base64.b64encode(plistlib.dumps(pl, fmt=plistlib.FMT_BINARY)).decode()
+    return ('<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF '
+            'xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
+            '<rdf:Description rdf:about="" '
+            'xmlns:apple_desktop="http://ns.apple.com/namespace/1.0/">'
+            f'<apple_desktop:h24>{b64}</apple_desktop:h24>'
+            '</rdf:Description></rdf:RDF></x:xmpmeta>').encode()
+
+
+def render_dynamic(w, h, seed, sharp, gmul, smul, path, backend="py", frames_n=32, quality=86):
+    """Render `frames_n` frames evenly across the day by interpolating the MOODS
+    journey, and pack them into a macOS Dynamic .heic. Same seed every frame → the
+    geometry is frozen and only colour/light drift, so the wallpaper changes subtly
+    and continuously (macOS switches frames at each scheduled time of day)."""
+    try:
+        import pillow_heif
+        from PIL import Image
+    except ImportError:
+        sys.exit("dynamic mode needs pillow-heif:\n"
+                 "  python3 -m pip install --user --break-system-packages pillow-heif")
+
+    frames, times, lums = [], [], []
+    UI.frames = frames_n
+    for n in range(frames_n):
+        t = n / frames_n
+        palette, glow, softness = day_look(t)
+        UI.frame = n
+        UI.say(f"\n── frame {n + 1}/{frames_n} · t={t:.3f} ({int(t*24):02d}:{int(t*24%1*60):02d}) "
+               f"· glow {glow * gmul:.2f} · bg {palette[0]} ──\n")
+        UI.event("frame", t=round(t, 4), clock=f"{int(t*24):02d}:{int(t*24%1*60):02d}")
+        buf = render(w, h, seed, palette, sharp, glow * gmul, softness * smul, backend)
+        frames.append(Image.frombytes("RGB", (w, h), bytes(buf)))
+        times.append(t)
+        lums.append(sum(palette[0]))               # background brightness
+
+    # Light/Dark appearance: brightest frame for Light mode, darkest for Dark.
+    light_idx = max(range(frames_n), key=lambda k: lums[k])
+    dark_idx = min(range(frames_n), key=lambda k: lums[k])
+
+    UI.say(f"\npacking {frames_n}-frame dynamic heic…\n")
+    UI.event("encode", frames=frames_n)
+    hf = pillow_heif.from_pillow(frames[0])
+    for im in frames[1:]:
+        hf.add_from_pillow(im)
+    hf.save(path, quality=quality, xmp=build_dynamic_xmp(times, light_idx, dark_idx))
+
+
+def set_wallpaper(path):
+    script = f'tell application "System Events" to set picture of every desktop to POSIX file "{path}"'
+    subprocess.run(["osascript", "-e", script], capture_output=True)
+    print("wallpaper set ✓")
+
+
+def main():
+    args = sys.argv[1:]
+    def opt(name, default=None):
+        return args[args.index(name) + 1] if name in args else default
+
+    UI.on = "--progress" in args                               # JSON events on stderr
+    UI.preview_path = opt("--preview")                         # live snapshot of the paint
+    UI.interval = max(float(opt("--preview-interval", "1.0")), 0.1)
+
+    palette = opt("--palette") or random.choice(list(PALETTES))
+    if palette not in PALETTES:
+        sys.exit(f"unknown palette {palette!r}; pick from {', '.join(PALETTES)}")
+    seed = int(opt("--seed", str(random.randrange(1 << 20))))
+    if opt("--size"):
+        w, h = (int(v) for v in opt("--size").lower().split("x"))
+    else:
+        w, h = display_size()
+
+    sharp = min(max(float(opt("--sharp", "0.6")), 0.0), 1.0)   # fraction of crisp strokes
+    backend = opt("--backend", "py")                           # py | c | gpu
+
+    outdir = os.path.expanduser("~/Pictures/advect")
+    out = opt("--out")                                         # explicit destination
+    if out:
+        outdir = os.path.dirname(os.path.abspath(out)) or "."
+    os.makedirs(outdir, exist_ok=True)
+
+    if "--dynamic" in args:
+        # In dynamic mode --glow / --softness are multipliers over the day cycle.
+        gmul = max(float(opt("--glow", "1.0")), 0.0)
+        smul = max(float(opt("--softness", "1.0")), 0.0)
+        frames_n = max(int(opt("--frames", "32")), 2)
+        path = out or os.path.join(outdir, f"day-{seed}.heic")
+        UI.say(f"advect · dynamic day-cycle · seed {seed} · {w}x{h} · "
+               f"{frames_n} frames · sharp {sharp}\n")
+        UI.event("start", dynamic=True, seed=seed, w=w, h=h, frames=frames_n,
+                 sharp=sharp, backend=backend, path=path)
+        render_dynamic(w, h, seed, sharp, gmul, smul, path, backend, frames_n)
+        print(path)
+        if "--set" in args:
+            set_wallpaper(path)
+        UI.event("done", path=path)
+        return
+
+    glow = max(float(opt("--glow", "0.7")), 0.0)               # diffuse light intensity
+    softness = max(float(opt("--softness", "1.0")), 0.0)       # how far the glow spreads
+
+    path = out or os.path.join(outdir, f"{palette}-{seed}.png")
+    UI.say(f"advect · {palette} · seed {seed} · {w}x{h} · "
+           f"sharp {sharp} glow {glow} softness {softness}\n")
+    UI.event("start", dynamic=False, seed=seed, w=w, h=h, palette=palette,
+             sharp=sharp, glow=glow, softness=softness, backend=backend, path=path)
+    buf = render(w, h, seed, palette, sharp, glow, softness, backend)
+
+    UI.event("encode")
+    write_png(path, w, h, buf)
+    print(path)
+
+    if "--set" in args:
+        set_wallpaper(path)
+    UI.event("done", path=path)
+
+
+if __name__ == "__main__":
+    main()
