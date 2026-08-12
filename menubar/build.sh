@@ -16,11 +16,26 @@
 #   SIGN_ID   the Developer ID Application identity, e.g.
 #             "Developer ID Application: Your Name (TEAMID)".
 #             Defaults to the only Developer ID in the keychain, if there is one.
-#   NOTARY_PROFILE  a notarytool keychain profile (default: advect-notary),
-#             created once with:
-#               xcrun notarytool store-credentials advect-notary \
-#                 --apple-id you@example.com --team-id TEAMID \
-#                 --password <app-specific-password>
+#   NOTARY_PROFILE  a notarytool keychain profile (default: advect-notary).
+#
+# Create the profile once, by either route — build.sh doesn't care which, since
+# both end up as the same kind of keychain entry:
+#
+#   App Store Connect API key (sturdier; survives Apple ID password changes,
+#   and it's the only one that works unattended in CI):
+#     xcrun notarytool store-credentials advect-notary \
+#       --key ~/private_keys/AuthKey_XXXXXXXXXX.p8 \
+#       --key-id XXXXXXXXXX --issuer <issuer-uuid>
+#
+#   Apple ID + app-specific password:
+#     xcrun notarytool store-credentials advect-notary \
+#       --apple-id you@example.com --team-id TEAMID \
+#       --password <app-specific-password>
+#
+#   The app-specific password must be generated at appleid.apple.com while
+#   signed in as that same Apple ID — one made under a different account gives
+#   an HTTP 401. Check the profile with:
+#     xcrun notarytool history --keychain-profile advect-notary
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
