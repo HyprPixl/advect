@@ -126,6 +126,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             item.target = self
             item.representedObject = backend.rawValue
             item.state = settings.backend == backend ? .on : .off
+            item.toolTip = backend.detail
+            if backend == .auto { sub.addItem(.separator()) }
         }
         return sub
     }
@@ -207,7 +209,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func pickBackend(_ sender: NSMenuItem) {
-        settings.backend = Backend(rawValue: sender.representedObject as? String ?? "") ?? .c
+        settings.backend = Backend(rawValue: sender.representedObject as? String ?? "") ?? .auto
     }
 
     @objc private func pickQuality(_ sender: NSMenuItem) {

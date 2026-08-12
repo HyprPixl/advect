@@ -5,6 +5,10 @@ and leave glowing lightning-like filaments on a dark ground. Every render is
 unique (or pass `--seed` to reproduce one). Stdlib-only for the `py`/`c` backends;
 writes real PNGs and macOS Dynamic `.heic` wallpapers.
 
+By default the compiled march (`cc` + ctypes) is used when a compiler is
+available, falling back to pure Python otherwise. Geometry is identical for a
+given seed either way.
+
 ```
 advect                    # render to ~/Pictures/advect/, print path
 advect --set              # render AND set as desktop wallpaper
@@ -12,7 +16,7 @@ advect --palette ember    # harbor | ember | moss | dune
 advect --seed 7 --size 2016x1310
 advect --sharp 0.7 --glow 0.9 --softness 1.5
 advect --dynamic --set    # a Dynamic .heic that shifts with the time of day
-advect --backend c        # compiled march via cc + ctypes, ~25x faster
+advect --backend py       # force the pure-stdlib march (slow; ~35x the C time)
 advect --backend gpu      # MLX on Apple Silicon (best at --dynamic scale)
 advect --out ~/wall.png   # write somewhere other than ~/Pictures/advect/
 ```
@@ -61,15 +65,15 @@ dark background; only the hue shifts by hour:
 |------|---------|--------|
 | night | `harbor` | red |
 | dawn / dusk | `ember` | orange |
-| morning / midday | `dune` | teal |
-| afternoon | `moss` | green |
+| morning / midday | `dune` | gold |
+| afternoon | `moss` | purple |
 
 ## Palettes
 
 | | |
 |---|---|
 | ![harbor](previews/harbor.png) **harbor** — red | ![ember](previews/ember.png) **ember** — orange |
-| ![moss](previews/moss.png) **moss** — green | ![dune](previews/dune.png) **dune** — teal |
+| ![moss](previews/moss.png) **moss** — purple | ![dune](previews/dune.png) **dune** — gold |
 
 `day-cycle.heic` is a rendered dynamic wallpaper you can set directly — 32 frames
 at 1024×662, small enough to keep in the repo. Render your own at display

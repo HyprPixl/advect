@@ -11,11 +11,14 @@ is unique (or use --seed to reproduce one). Stdlib only, writes real PNGs.
   advect --sharp 0.7 --glow 0.9 --softness 1.5   # crisper lines, brighter, softer glow
   advect --dynamic --set    # a Dynamic .heic that shifts with the time of day
   advect --dynamic --frames 32   # more frames = subtler, more continuous drift
-  advect --backend c        # compiled march via cc + ctypes: same seed, ~25x faster
+  advect --backend py       # force the pure-stdlib march (slow; ~35x the C time)
   advect --backend gpu      # MLX on Apple Silicon (best at native/--dynamic scale)
   advect --out ~/wall.png   # write here instead of ~/Pictures/advect/
   advect --progress         # one JSON event per line on stderr, for a GUI host
   advect --preview /tmp/p.png    # keep a small live snapshot of the painting there
+
+By default the compiled march (cc + ctypes) is used when a compiler is available,
+falling back to pure Python otherwise. Geometry is identical for a given seed.
 
 Dynamic mode interpolates the MOODS journey into many frames sharing one seed, so
 the geometry is frozen and only colour/light drift — subtle, continuous change.
@@ -42,8 +45,8 @@ PALETTES = {
     # keeps a near-black ground so the colour blazes. Only the hue shifts by hour.
     "harbor": ((20, 10, 12), [(255, 72, 58), (220, 40, 50), (255, 132, 108), (150, 44, 62)]),       # red — night filaments blaze
     "ember": ((24, 15, 18), [(242, 149, 68), (214, 78, 60), (255, 209, 102), (120, 60, 80)]),       # orange — dawn/dusk fire
-    "moss": ((18, 26, 20), [(126, 168, 90), (214, 205, 154), (58, 110, 92), (240, 244, 235)]),      # green — afternoon
-    "dune": ((16, 24, 33), [(63, 191, 188), (208, 178, 125), (94, 129, 172), (233, 236, 239)]),     # teal — morning, dark bg
+    "moss": ((14, 14, 22), [(155, 93, 229), (45, 166, 178), (200, 160, 255), (58, 40, 90)]),         # purple/teal — afternoon
+    "dune": ((22, 17, 10), [(255, 183, 59), (224, 122, 29), (255, 214, 133), (94, 64, 24)]),         # gold/orange — morning, dark bg
 }
 
 # A day in one flow field: same seed → identical geometry, only the light shifts.
@@ -53,9 +56,9 @@ DAY_CYCLE = [
     ("harbor", 0.00, 1.10, 1.4),   # deep night — red filaments blaze in the dark
     ("harbor", 0.18, 0.80, 1.3),   # small hours
     ("ember",  0.28, 0.65, 1.1),   # dawn — fire orange
-    ("dune",   0.40, 0.45, 1.0),   # morning — teal
-    ("dune",   0.50, 0.30, 1.0),   # midday — teal, glow recedes
-    ("moss",   0.63, 0.50, 1.1),   # afternoon green
+    ("dune",   0.40, 0.45, 1.0),   # morning — gold/orange
+    ("dune",   0.50, 0.30, 1.0),   # midday — gold/orange, glow recedes
+    ("moss",   0.63, 0.50, 1.1),   # afternoon purple/teal
     ("ember",  0.78, 0.95, 1.3),   # sunset orange
     ("harbor", 0.90, 1.05, 1.4),   # nightfall red
 ]
@@ -69,9 +72,9 @@ MOODS = [
     (0.16, "harbor", 0.80, 1.30),   # small hours, dimming
     (0.27, "ember",  0.66, 1.15),   # first fire before dawn
     (0.36, "ember",  0.52, 1.05),   # dawn — orange
-    (0.45, "dune",   0.40, 1.00),   # morning — teal
-    (0.52, "dune",   0.26, 1.00),   # midday — teal, glow recedes
-    (0.62, "moss",   0.44, 1.05),   # early afternoon green
+    (0.45, "dune",   0.40, 1.00),   # morning — gold/orange
+    (0.52, "dune",   0.26, 1.00),   # midday — gold/orange, glow recedes
+    (0.62, "moss",   0.44, 1.05),   # early afternoon purple/teal
     (0.72, "moss",   0.60, 1.12),   # afternoon deepens
     (0.81, "ember",  0.92, 1.25),   # sunset orange
     (0.90, "ember",  1.06, 1.35),   # dusk, glow returns
@@ -459,12 +462,12 @@ def _load_clib():
     os.makedirs(cache, exist_ok=True)
     so = os.path.join(cache, "accel.so")
     if not os.path.exists(so) or os.path.getmtime(so) < os.path.getmtime(src):
-        print("compiling C backend…", end="", flush=True)
+        UI.say("compiling C backend…")
         r = subprocess.run(["cc", "-O3", "-shared", "-fPIC", "-o", so, src],
                            capture_output=True, text=True)
         if r.returncode:
             sys.exit("\nC backend failed to compile:\n" + r.stderr)
-        print("\r                    \r", end="")
+        UI.say("\r                    \r")
     lib = ctypes.CDLL(so)
     d, u8, f32 = ctypes.POINTER(ctypes.c_double), ctypes.POINTER(ctypes.c_uint8), ctypes.POINTER(ctypes.c_float)
     lib.fp_march.argtypes = [d, ctypes.c_double, ctypes.c_double, ctypes.c_int, ctypes.c_int,
@@ -638,13 +641,26 @@ def render_gpu(sc, glow, softness):
     return buf
 
 
+def resolve_backend(backend):
+    """`auto` (the default) prefers the C march — identical geometry for a given
+    seed, ~35x faster at native size — and drops back to pure Python if there is
+    no working compiler. `--backend py` still forces the stdlib path."""
+    if backend != "auto":
+        return backend
+    try:
+        _load_clib()
+        return "c"
+    except (SystemExit, Exception):   # no cc, no headers, bad .so — py still works
+        return "py"
+
+
 def render_accel(backend, w, h, seed, palette, sharp, glow, softness):
     sc = build_scene(w, h, seed, palette, sharp, glow)
     if backend == "c":
         return render_c(sc, glow, softness)
     if backend == "gpu":
         return render_gpu(sc, glow, softness)
-    sys.exit(f"unknown backend {backend!r}; pick from py, c, gpu")
+    sys.exit(f"unknown backend {backend!r}; pick from auto, py, c, gpu")
 
 
 def build_dynamic_xmp(times, light_idx, dark_idx):
@@ -708,6 +724,11 @@ def set_wallpaper(path):
 
 def main():
     args = sys.argv[1:]
+    if {"--help", "-help", "-h"} & set(args):
+        print(__doc__.strip())
+        print(f"\npalettes: {', '.join(PALETTES)}")
+        return
+
     def opt(name, default=None):
         return args[args.index(name) + 1] if name in args else default
 
@@ -725,7 +746,7 @@ def main():
         w, h = display_size()
 
     sharp = min(max(float(opt("--sharp", "0.6")), 0.0), 1.0)   # fraction of crisp strokes
-    backend = opt("--backend", "py")                           # py | c | gpu
+    backend = resolve_backend(opt("--backend", "auto"))        # auto | py | c | gpu
 
     outdir = os.path.expanduser("~/Pictures/advect")
     out = opt("--out")                                         # explicit destination

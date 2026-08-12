@@ -10,13 +10,23 @@ enum Palette: String, CaseIterable {
 }
 
 enum Backend: String, CaseIterable {
-    case c, gpu, py
+    case auto, c, gpu, py
 
     var title: String {
         switch self {
+        case .auto: return "Automatic"
         case .c: return "C — fast"
         case .gpu: return "GPU — best at full size"
         case .py: return "Pure Python — slow"
+        }
+    }
+
+    var detail: String? {
+        switch self {
+        case .auto: return "Compiled march when a compiler is available, else pure Python"
+        case .gpu: return "Needs MLX installed"
+        case .py: return "Roughly 35× the C time"
+        case .c: return nil
         }
     }
 }
@@ -79,7 +89,7 @@ final class Settings {
     private init() {
         store.register(defaults: [
             "palette": Palette.random.rawValue,
-            "backend": Backend.c.rawValue,
+            "backend": Backend.auto.rawValue,
             "quality": Quality.native.rawValue,
             "rotate": Rotate.off.rawValue,
             "frames": 32,
@@ -93,7 +103,7 @@ final class Settings {
     }
 
     var backend: Backend {
-        get { Backend(rawValue: store.string(forKey: "backend") ?? "") ?? .c }
+        get { Backend(rawValue: store.string(forKey: "backend") ?? "") ?? .auto }
         set { store.set(newValue.rawValue, forKey: "backend") }
     }
 
