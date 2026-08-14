@@ -117,11 +117,19 @@ final class PreviewPanel: NSPanel {
         cancelButton.isEnabled = false
         DispatchQueue.main.asyncAfter(deadline: .now() + lingering) { [weak self] in
             guard let self, self.cancelButton.isEnabled == false else { return }
-            self.orderOut(nil)
+            self.hide()
         }
     }
 
-    func dismiss() { orderOut(nil) }
+    func dismiss() { hide() }
+
+    /// Always leave the bar empty behind us. NSProgressIndicator animates a
+    /// change in value, so a panel put away at 100 and reopened at 0 visibly
+    /// sweeps down from full before the first real progress lands.
+    private func hide() {
+        orderOut(nil)
+        bar.doubleValue = 0
+    }
 
     /// First run has no saved frame — tuck it into the bottom-right corner.
     private func placeIfNeeded() {

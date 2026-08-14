@@ -27,7 +27,10 @@ From the menu bar you get:
 - Palette, size and frame-count pickers, and **Launch at Login**
 
 While it paints, a floating panel shows the picture arriving, with a progress bar
-and a Cancel button. Wallpapers are set through `NSWorkspace`, so the app never
+and a Cancel button. Turn on **Paint on Desktop** and it skips the panel
+entirely — the wallpaper itself redraws about ten times a second, so you watch
+the picture appear at full size. That costs roughly 7% of a render, so it's off
+by default. Wallpapers are set through `NSWorkspace`, so the app never
 asks for Automation permission — it needs no permissions at all.
 
 Renders can be triggered from outside too, for a hotkey, a Shortcut or a macro pad:

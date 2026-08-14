@@ -26,6 +26,7 @@ final class RenderJob {
     private let frames: Int
     private let cancelled = NSLock.Flag()
     private var lastPreview = Date.distantPast
+    private let desktop: DesktopPainter?
 
     /// Exactly the panel's backing width: 420pt at the display's scale factor.
     /// Less than this gets stretched back up and looks soft; more is wasted.
@@ -50,6 +51,7 @@ final class RenderJob {
         self.frames = settings.frames
         let chosen = settings.palette.flag ?? PaletteSpec.order.randomElement()!
         self.paletteName = chosen
+        self.desktop = settings.paintOnDesktop ? DesktopPainter() : nil
     }
 
     var summary: String {
@@ -68,7 +70,16 @@ final class RenderJob {
             case .still: result = renderStill()
             case .dynamic: result = renderDayCycle()
             }
-            DispatchQueue.main.async { self.onFinish?(result) }
+            // A finished render gets its real wallpaper set by the caller; a
+            // cancelled one has to put back what was on the desktop before.
+            // Either way the frame currently on screen survives until the
+            // handover completes — deleting it early drops macOS back to its
+            // stock wallpaper for a moment.
+            if case .failure = result, isCancelled { desktop?.restore() } else { desktop?.cleanUp() }
+            DispatchQueue.main.async { [self] in
+                onFinish?(result)               // the caller sets the real wallpaper here
+                desktop?.releaseAfterHandover()
+            }
         }
     }
 
@@ -150,6 +161,7 @@ final class RenderJob {
     /// here so the main queue only ever receives a small finished image.
     private func report(_ percent: Double, _ phase: String, _ buffer: [UInt8]?) {
         let status = "\(summary) · \(phase) · \(Int(percent))%"
+        if let buffer { desktop?.paint(buffer, width: size.w, height: size.h) }
         var image: NSImage?
         if let buffer, Date().timeIntervalSince(lastPreview) >= previewInterval {
             lastPreview = Date()

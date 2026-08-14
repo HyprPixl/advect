@@ -98,6 +98,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         preview.target = self
         preview.state = settings.showPreview ? .on : .off
 
+        let onDesktop = menu.addItem(withTitle: "Paint on Desktop",
+                                     action: #selector(togglePaintOnDesktop), keyEquivalent: "")
+        onDesktop.target = self
+        onDesktop.state = settings.paintOnDesktop ? .on : .off
+        onDesktop.toolTip = "Show the render on the desktop itself as it paints"
+
         let login = menu.addItem(withTitle: "Launch at Login", action: #selector(toggleLaunchAtLogin), keyEquivalent: "")
         login.target = self
         login.state = SMAppService.mainApp.status == .enabled ? .on : .off
@@ -211,6 +217,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func togglePreview() {
         settings.showPreview.toggle()
         if !settings.showPreview { previewPanel.dismiss() }
+    }
+
+    @objc private func togglePaintOnDesktop() {
+        settings.paintOnDesktop.toggle()
     }
 
     @objc private func toggleLaunchAtLogin() {

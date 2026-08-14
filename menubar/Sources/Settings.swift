@@ -101,6 +101,14 @@ final class Settings {
         set { store.set(newValue, forKey: "showPreview") }
     }
 
+    /// Paint onto the desktop itself as it renders, rather than only into the
+    /// panel. Costs roughly 9% of a render and churns the wallpaper; off by
+    /// default because it's a spectacle, not a default behaviour.
+    var paintOnDesktop: Bool {
+        get { store.bool(forKey: "paintOnDesktop") }
+        set { store.set(newValue, forKey: "paintOnDesktop") }
+    }
+
     /// When auto-rotate last fired, so quitting doesn't restart the clock.
     var lastRotate: Date {
         get { store.object(forKey: "lastRotate") as? Date ?? .distantPast }
