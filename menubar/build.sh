@@ -6,8 +6,8 @@
 #   ./build.sh --notarize   sign with a Developer ID, notarize, and staple
 #
 # No Xcode project and no package manager: swiftc compiles the sources straight
-# into a hand-laid bundle, and the renderer is copied in beside it so the .app
-# keeps working wherever the repo ends up.
+# into a hand-laid bundle, with the renderer and the C march compiled in. The
+# result is one self-contained binary that needs nothing installed to run.
 #
 # Ad-hoc signing is fine on the machine that built it. Anything you hand to
 # someone else has to be signed with a Developer ID *and* notarized, or
@@ -57,20 +57,21 @@ done
 rm -rf "$app"
 mkdir -p "$contents/MacOS" "$contents/Resources"
 
+echo "compiling the C march…"
+cc -O3 -target arm64-apple-macos13.0 -c "$repo/advect_accel.c" -o "$build/advect_accel.o"
+
 echo "compiling…"
+# The renderer is compiled *into* the binary — no interpreter, no scripts in
+# Resources, nothing to find at run time. The app works on a stock Mac.
 swiftc -O \
     -target arm64-apple-macos13.0 \
     -framework AppKit -framework ServiceManagement -framework ImageIO \
+    -import-objc-header "$here/Sources/Render/advect_accel.h" \
     -o "$contents/MacOS/Advect" \
-    "$here"/Sources/*.swift
+    "$here"/Sources/*.swift "$here"/Sources/Render/*.swift \
+    "$build/advect_accel.o"
 
 cp "$here/Resources/Info.plist" "$contents/Info.plist"
-
-# The renderer travels inside the bundle. advect locates advect_accel.c
-# relative to its own path, so the C source has to sit right next to it.
-cp "$repo/advect" "$contents/Resources/advect"
-cp "$repo/advect_accel.c" "$contents/Resources/advect_accel.c"
-chmod +x "$contents/Resources/advect"
 
 # The app wears its own output as its icon: a fixed seed and palette, so it looks
 # the same on every machine and doesn't change from build to build. Cached, since
@@ -82,7 +83,7 @@ if [ ! -f "$icon_source" ]; then
     # the most contrast once the whole thing is a few pixels across. The warmer
     # palettes lose their strokes into the background at that size.
     python3 "$repo/advect" --seed 90210 --size 1024x1024 --palette moss \
-        --glow 1.5 --sharp 0.45 --backend c --out "$icon_source" >/dev/null
+        --glow 1.5 --sharp 0.45 --out "$icon_source" >/dev/null
 fi
 
 echo "making icon…"
@@ -115,8 +116,8 @@ if [ "$notarize" = 1 ]; then
     # of the variable name.
     echo "signing as ${sign_id}…"
     # Hardened runtime and a secure timestamp are both prerequisites for
-    # notarization; the app spawns python3 as a child process, which the
-    # hardened runtime permits without any extra entitlement.
+    # notarization. Nothing here needs an entitlement exception: the app spawns
+    # no subprocesses and loads no code it didn't ship with.
     codesign --force --options runtime --timestamp --sign "$sign_id" "$app"
 else
     codesign --force --sign - "$app" >/dev/null 2>&1 || echo "warning: codesign failed"

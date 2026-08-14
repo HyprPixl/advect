@@ -12,7 +12,6 @@ is unique (or use --seed to reproduce one). Stdlib only, writes real PNGs.
   advect --dynamic --set    # a Dynamic .heic that shifts with the time of day
   advect --dynamic --frames 32   # more frames = subtler, more continuous drift
   advect --backend py       # force the pure-stdlib march (slow; ~35x the C time)
-  advect --backend gpu      # MLX on Apple Silicon (best at native/--dynamic scale)
   advect --out ~/wall.png   # write here instead of ~/Pictures/advect/
   advect --progress         # one JSON event per line on stderr, for a GUI host
   advect --preview /tmp/p.png    # keep a small live snapshot of the painting there
@@ -23,9 +22,8 @@ falling back to pure Python otherwise. Geometry is identical for a given seed.
 Dynamic mode interpolates the MOODS journey into many frames sharing one seed, so
 the geometry is frozen and only colour/light drift — subtle, continuous change.
 
-Backends produce the same geometry for a given seed (the diffuse glow layer may
-differ by <1 level under GPU's parallel accumulation). Stdlib only for --backend
-py/c; gpu needs mlx.
+Both backends produce byte-identical output for a given seed, and both are
+stdlib only — the C one is compiled on demand with cc.
 """
 
 import json
@@ -406,7 +404,7 @@ def render(w, h, seed, palette, sharp=0.6, glow=0.7, softness=1.0, backend="py")
 
 # ── accelerated backends ───────────────────────────────────────────────────
 # Python owns every rng draw (grids, twist, per-particle spec) so seeds stay
-# bit-reproducible; the C / GPU kernels only do the hot march + splat + glow.
+# bit-reproducible; the C kernel only does the hot march + splat + glow.
 
 def build_scene(w, h, seed, palette, sharp, glow):
     """Reproduce render()'s exact rng sequence, but emit the per-particle spec
@@ -546,101 +544,6 @@ def render_c(sc, glow, softness):
     return buf
 
 
-def _gpu_diffuse_light(sc):
-    """March the diffuse particles on the GPU (MLX) and scatter their emitted
-    energy into the light grid. Order-independent additive accumulation → a
-    legitimate parallel reduction. float32 (Metal has no f64), so filaments
-    diverge slightly from the f64 reference over many steps — same look, blurred
-    anyway. Returns a flat array('f') light grid, or None if no diffuse strokes."""
-    import mlx.core as mx
-    pmode, px, py, pcol = sc["pmode"], sc["px"], sc["py"], sc["pcol"]
-    idx = [i for i in range(sc["n"]) if pmode[i]]
-    if not idx:
-        return None
-    w, h, DS, lw, lh = sc["w"], sc["h"], sc["DS"], sc["lw"], sc["lh"]
-    x = mx.array([px[i] for i in idx], dtype=mx.float32)
-    y = mx.array([py[i] for i in idx], dtype=mx.float32)
-    lk = LIGHT_K * deposit_scale()
-    er = mx.array([[pcol[i * 3] * lk, pcol[i * 3 + 1] * lk,
-                    pcol[i * 3 + 2] * lk] for i in idx], dtype=mx.float32)
-    g = mx.array(list(sc["fieldg"]), dtype=mx.float32).reshape(64, 64)
-    cell, twist = float(sc["cell"]), float(sc["twist"])
-
-    def fbm(x, y):
-        def raw(x, y):
-            gx, gy = x / cell, y / cell
-            ix, iy = gx.astype(mx.int32) & 63, gy.astype(mx.int32) & 63
-            fx, fy = gx - mx.floor(gx), gy - mx.floor(gy)
-            sx, sy = fx * fx * (3 - 2 * fx), fy * fy * (3 - 2 * fy)
-            ix1, iy1 = (ix + 1) & 63, (iy + 1) & 63
-            a, b = g[iy, ix], g[iy, ix1]
-            c, d = g[iy1, ix], g[iy1, ix1]
-            return a + (b - a) * sx + (c - a) * sy + (a - b - c + d) * sx * sy
-        return raw(x, y) * 0.5 + raw(x * 2.1 + 31, y * 2.1 + 57) * 0.3 \
-                              + raw(x * 4.3 + 89, y * 4.3 + 13) * 0.2
-
-    tw = sc["tw"]
-    light = mx.zeros((lw * lh, 3))
-    alive = mx.ones(len(idx), dtype=mx.bool_)
-    for s in range(sc["steps"]):
-        theta = fbm(x, y) * twist
-        nx, ny = x + mx.cos(theta) * 1.6, y + mx.sin(theta) * 1.6
-        inb = (nx >= 1) & (nx < w - 1) & (ny >= 1) & (ny < h - 1)
-        alive = alive & inb                       # step that leaves bounds doesn't count
-        x, y = mx.where(alive, nx, x), mx.where(alive, ny, y)
-        cell_idx = (y.astype(mx.int32) // DS) * lw + x.astype(mx.int32) // DS
-        light = light.at[cell_idx].add(er * (alive.astype(mx.float32) * tw[s])[:, None])
-        if s % 64 == 0:
-            mx.eval(light, x, y, alive)
-            pct = 100 * s // sc["steps"]
-            UI.say(f"\rmarching light (GPU)… {pct}%")
-            UI.event("glow", pct=pct)
-    mx.eval(light)
-    return array("f", memoryview(light.reshape(-1)))
-
-
-def render_gpu(sc, glow, softness):
-    import ctypes
-    lib = _load_clib()
-    buf = sc["buf"]
-    n, pmode = sc["n"], sc["pmode"]
-    t0 = time.time()
-    UI.say("painting (GPU)…")
-
-    # sharp strokes: exact, ordered alpha-blend on the C backend (diffuse skipped)
-    sidx = [i for i in range(n) if pmode[i] == 0]
-    if sidx:
-        px, py, palpha, pcol = sc["px"], sc["py"], sc["palpha"], sc["pcol"]
-        sx = array("d", (px[i] for i in sidx))
-        sy = array("d", (py[i] for i in sidx))
-        sal = array("d", (palpha[i] for i in sidx))
-        smode = bytearray(len(sidx))              # all sharp
-        scol = bytearray()
-        for i in sidx:
-            scol += pcol[i * 3:i * 3 + 3]
-        _march_chunked(lib, sc, _ptr(sx, ctypes.c_double), _ptr(sy, ctypes.c_double),
-                       _ptr(smode, ctypes.c_uint8), _ptr(sal, ctypes.c_double),
-                       _ptr(scol, ctypes.c_uint8), len(sidx), buf, None, "GPU")
-
-    # diffuse glow: parallel march + scatter on the GPU
-    if sc["use_glow"]:
-        light = _gpu_diffuse_light(sc)
-        if light is not None:
-            UI.say("\rdiffusing light…        ")
-            UI.event("light")
-            r = max(1, round(3 * softness))
-            for c in range(3):
-                ch = light[c::3]
-                box_blur(ch, sc["lw"], sc["lh"], r)
-                light[c::3] = ch
-            lib.fp_composite(_ptr(buf, ctypes.c_uint8), _ptr(light, ctypes.c_float), glow,
-                             sc["lw"], sc["lh"], sc["DS"], sc["w"], sc["h"])
-    UI.say(f"\rpainted in {time.time()-t0:.1f}s  (GPU)      \n")
-    UI.paint(100)
-    UI.snapshot(buf, sc["w"], sc["h"])
-    return buf
-
-
 def resolve_backend(backend):
     """`auto` (the default) prefers the C march — identical geometry for a given
     seed, ~35x faster at native size — and drops back to pure Python if there is
@@ -658,9 +561,7 @@ def render_accel(backend, w, h, seed, palette, sharp, glow, softness):
     sc = build_scene(w, h, seed, palette, sharp, glow)
     if backend == "c":
         return render_c(sc, glow, softness)
-    if backend == "gpu":
-        return render_gpu(sc, glow, softness)
-    sys.exit(f"unknown backend {backend!r}; pick from auto, py, c, gpu")
+    sys.exit(f"unknown backend {backend!r}; pick from auto, py, c")
 
 
 def build_dynamic_xmp(times, light_idx, dark_idx):
@@ -746,7 +647,7 @@ def main():
         w, h = display_size()
 
     sharp = min(max(float(opt("--sharp", "0.6")), 0.0), 1.0)   # fraction of crisp strokes
-    backend = resolve_backend(opt("--backend", "auto"))        # auto | py | c | gpu
+    backend = resolve_backend(opt("--backend", "auto"))        # auto | py | c
 
     outdir = os.path.expanduser("~/Pictures/advect")
     out = opt("--out")                                         # explicit destination

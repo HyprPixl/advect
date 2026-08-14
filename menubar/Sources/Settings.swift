@@ -9,28 +9,6 @@ enum Palette: String, CaseIterable {
     var flag: String? { self == .random ? nil : rawValue }
 }
 
-enum Backend: String, CaseIterable {
-    case auto, c, gpu, py
-
-    var title: String {
-        switch self {
-        case .auto: return "Automatic"
-        case .c: return "C — fast"
-        case .gpu: return "GPU — best at full size"
-        case .py: return "Pure Python — slow"
-        }
-    }
-
-    var detail: String? {
-        switch self {
-        case .auto: return "Compiled march when a compiler is available, else pure Python"
-        case .gpu: return "Needs MLX installed"
-        case .py: return "Roughly 35× the C time"
-        case .c: return nil
-        }
-    }
-}
-
 /// Render size, as a fraction of the display's native pixel size. Native looks
 /// best; the smaller ones exist because a full-size Python render is minutes.
 enum Quality: String, CaseIterable {
@@ -89,7 +67,6 @@ final class Settings {
     private init() {
         store.register(defaults: [
             "palette": Palette.random.rawValue,
-            "backend": Backend.auto.rawValue,
             "quality": Quality.native.rawValue,
             "rotate": Rotate.off.rawValue,
             "frames": 32,
@@ -100,11 +77,6 @@ final class Settings {
     var palette: Palette {
         get { Palette(rawValue: store.string(forKey: "palette") ?? "") ?? .random }
         set { store.set(newValue.rawValue, forKey: "palette") }
-    }
-
-    var backend: Backend {
-        get { Backend(rawValue: store.string(forKey: "backend") ?? "") ?? .auto }
-        set { store.set(newValue.rawValue, forKey: "backend") }
     }
 
     var quality: Quality {

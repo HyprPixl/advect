@@ -84,7 +84,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         menu.addItem(.separator())
         menu.addItem(submenu: paletteMenu(), title: "Palette")
-        menu.addItem(submenu: backendMenu(), title: "Backend")
         menu.addItem(submenu: qualityMenu(), title: "Size")
         menu.addItem(submenu: framesMenu(), title: "Day Cycle Frames")
         menu.addItem(submenu: rotateMenu(), title: "Auto-Rotate")
@@ -115,19 +114,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             item.representedObject = palette.rawValue
             item.state = settings.palette == palette ? .on : .off
             if palette == .random { sub.addItem(.separator()) }
-        }
-        return sub
-    }
-
-    private func backendMenu() -> NSMenu {
-        let sub = NSMenu()
-        for backend in Backend.allCases {
-            let item = sub.addItem(withTitle: backend.title, action: #selector(pickBackend(_:)), keyEquivalent: "")
-            item.target = self
-            item.representedObject = backend.rawValue
-            item.state = settings.backend == backend ? .on : .off
-            item.toolTip = backend.detail
-            if backend == .auto { sub.addItem(.separator()) }
         }
         return sub
     }
@@ -208,10 +194,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         settings.palette = Palette(rawValue: sender.representedObject as? String ?? "") ?? .random
     }
 
-    @objc private func pickBackend(_ sender: NSMenuItem) {
-        settings.backend = Backend(rawValue: sender.representedObject as? String ?? "") ?? .auto
-    }
-
     @objc private func pickQuality(_ sender: NSMenuItem) {
         settings.quality = Quality(rawValue: sender.representedObject as? String ?? "") ?? .native
     }
@@ -287,7 +269,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if settings.showPreview { previewPanel.begin(job.summary) }
         updateStatusButton()
 
-        job.onEvent = { [weak self] event in self?.handle(event, of: job) }
+        job.onProgress = { [weak self] percent, status in
+            guard let self else { return }
+            self.liveProgress = percent
+            self.liveStatus = status
+            self.previewPanel.update(progress: percent, caption: status)
+            self.liveItem?.title = status
+            self.updateStatusButton()
+        }
         job.onPreview = { [weak self] image in
             guard let self else { return }
             self.liveImage = image
@@ -304,44 +293,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 if setWhenDone { self.applyWallpaper(url) }
             case .failure(let error):
                 self.previewPanel.dismiss()
-                if !job.cancelled {
+                if !job.isCancelled {
                     self.report(title: "Render failed", message: error.localizedDescription)
                 }
             }
         }
-
-        do {
-            try job.start()
-        } catch {
-            self.job = nil
-            previewPanel.dismiss()
-            updateStatusButton()
-            report(title: "Couldn’t start the render", message: error.localizedDescription)
-        }
-    }
-
-    private func handle(_ event: RenderEvent, of job: RenderJob) {
-        switch event.phase {
-        case "paint":
-            liveProgress = event.overall ?? event.pct ?? liveProgress
-            var text = "\(job.summary) · \(Int(liveProgress))%"
-            if let frame = event.frame, let frames = event.frames, frames > 1 {
-                text = "\(job.summary) · frame \(frame + 1)/\(frames) · \(Int(liveProgress))%"
-            }
-            liveStatus = text
-        case "light":
-            liveStatus = "\(job.summary) · diffusing light…"
-        case "glow":
-            liveStatus = "\(job.summary) · marching light… \(Int(event.pct ?? 0))%"
-        case "encode":
-            liveProgress = 100
-            liveStatus = job.kind == .dynamic ? "packing dynamic wallpaper…" : "writing PNG…"
-        default:
-            return
-        }
-        previewPanel.update(progress: liveProgress, caption: liveStatus)
-        liveItem?.title = liveStatus
-        updateStatusButton()
+        job.start()
     }
 
     private func updateStatusButton() {

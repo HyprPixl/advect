@@ -6,252 +6,178 @@ struct RenderError: LocalizedError {
     var errorDescription: String? { message }
 }
 
-/// One line of the renderer's `--progress` stream.
-struct RenderEvent {
-    let phase: String
-    var pct: Double?
-    var overall: Double?
-    var path: String?
-    var frame: Int?
-    var frames: Int?
-    var clock: String?
-
-    init?(line: String) {
-        guard let data = line.data(using: .utf8),
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let phase = obj["phase"] as? String
-        else { return nil }
-        self.phase = phase
-        pct = obj["pct"] as? Double
-        overall = obj["overall"] as? Double
-        path = obj["path"] as? String
-        frame = obj["frame"] as? Int
-        frames = obj["frames"] as? Int
-        clock = obj["clock"] as? String
-    }
-}
-
-/// Finds a python3 that can actually run the job. The bundle can't rely on the
-/// launching PATH — an app started by Finder doesn't see Homebrew — so we probe
-/// the usual locations, and for Dynamic mode insist on one that has pillow-heif.
-enum Python {
-    private static var cache: [Bool: String] = [:]
-
-    private static var candidates: [String] {
-        var paths: [String] = []
-        if let override = UserDefaults.standard.string(forKey: "pythonPath") { paths.append(override) }
-        paths += ["/opt/homebrew/bin/python3", "/usr/local/bin/python3", "/usr/bin/python3"]
-        return paths
-    }
-
-    static func interpreter(needsHEIF: Bool) -> String? {
-        if let hit = cache[needsHEIF] { return hit }
-        let usable = candidates.first { path in
-            guard FileManager.default.isExecutableFile(atPath: path) else { return false }
-            return needsHEIF ? canImport("pillow_heif", python: path) : true
-        }
-        cache[needsHEIF] = usable
-        return usable
-    }
-
-    private static func canImport(_ module: String, python: String) -> Bool {
-        let probe = Process()
-        probe.executableURL = URL(fileURLWithPath: python)
-        probe.arguments = ["-c", "import \(module)"]
-        probe.standardOutput = FileHandle.nullDevice
-        probe.standardError = FileHandle.nullDevice
-        do { try probe.run() } catch { return false }
-        probe.waitUntilExit()
-        return probe.terminationStatus == 0
-    }
-}
-
-/// A single run of the renderer, wrapped so the menu bar can watch it paint.
+/// One render, run on a background queue.
 ///
-/// stderr carries the JSON event stream; stdout is only kept so a crash can be
-/// reported with something readable in it.
+/// There is no subprocess and no interpreter: the renderer is compiled into this
+/// binary, so the app is self-contained and works on a Mac with nothing else
+/// installed. Callbacks arrive on the main queue.
 final class RenderJob {
     enum Kind { case still, dynamic }
 
     let kind: Kind
     let seed: Int
-    let palette: Palette
+    let paletteName: String        // the palette actually used, once Random is resolved
 
-    var onEvent: ((RenderEvent) -> Void)?
+    var onProgress: ((Double, String) -> Void)?     // 0–100, status line
     var onPreview: ((NSImage) -> Void)?
     var onFinish: ((Result<URL, RenderError>) -> Void)?
 
-    private let process = Process()
-    private let previewURL: URL
-    private var pending = Data()
-    private var output = Data()
-    private var diagnostics: [String] = []      // stderr lines that weren't events
-    private var announcedPath: String?          // destination, as reported by the events
-    private let lock = NSLock()                 // guards the three fields above
-    private var finished = false
-    private(set) var cancelled = false
+    private let size: (w: Int, h: Int)
+    private let frames: Int
+    private let cancelled = NSLock.Flag()
+    private var lastPreview = Date.distantPast
+
+    /// How wide the live preview is drawn. Small enough that building one
+    /// mid-render costs nothing next to the march.
+    private let previewWidth = 640
 
     init(kind: Kind, settings: Settings = .shared) {
         self.kind = kind
         self.seed = Int.random(in: 0..<(1 << 20))
-        self.palette = settings.palette
-        let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("Advect", isDirectory: true)
-        try? FileManager.default.createDirectory(at: caches, withIntermediateDirectories: true)
-        previewURL = caches.appendingPathComponent("paint-\(seed).png")
+        self.size = settings.quality.size
+        self.frames = settings.frames
+        let chosen = settings.palette.flag ?? PaletteSpec.order.randomElement()!
+        self.paletteName = chosen
     }
 
-    /// A one-line description of what this job is making, for the menu and panel.
     var summary: String {
-        let size = Settings.shared.quality.size
-        let what = kind == .dynamic ? "day cycle" : (palette.flag ?? "random")
+        let what = kind == .dynamic ? "day cycle" : paletteName
         return "\(what) · seed \(seed) · \(size.w)×\(size.h)"
     }
 
-    func start() throws {
-        let settings = Settings.shared
-        guard let python = Python.interpreter(needsHEIF: kind == .dynamic) else {
-            throw RenderError(message: kind == .dynamic
-                ? "Dynamic mode needs a python3 with pillow-heif installed.\n\n"
-                  + "Install it with:\n    python3 -m pip install --user --break-system-packages pillow-heif"
-                : "No python3 found in /opt/homebrew/bin, /usr/local/bin or /usr/bin.")
-        }
-        guard let script = Bundle.main.url(forResource: "advect", withExtension: nil) else {
-            throw RenderError(message: "The advect renderer is missing from the app bundle.")
-        }
+    var isCancelled: Bool { cancelled.value }
 
-        let size = settings.quality.size
-        var args = [
-            script.path,
-            "--seed", String(seed),
-            "--size", "\(size.w)x\(size.h)",
-            "--backend", settings.backend.rawValue,
-            "--progress",
-            "--preview", previewURL.path,
-            "--preview-interval", "0.7",
-        ]
-        if kind == .dynamic {
-            args += ["--dynamic", "--frames", String(settings.frames)]
-        } else if let name = palette.flag {
-            args += ["--palette", name]
+    func cancel() { cancelled.value = true }
+
+    func start() {
+        DispatchQueue.global(qos: .userInitiated).async { [self] in
+            let result: Result<URL, RenderError>
+            switch kind {
+            case .still: result = renderStill()
+            case .dynamic: result = renderDayCycle()
+            }
+            DispatchQueue.main.async { self.onFinish?(result) }
         }
+    }
 
-        process.executableURL = URL(fileURLWithPath: python)
-        process.arguments = args
-        var env = ProcessInfo.processInfo.environment
-        // The C backend shells out to `cc`, so /usr/bin has to be reachable even
-        // when the app was launched by Finder rather than a shell.
-        env["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin"
-        env["PYTHONUNBUFFERED"] = "1"
-        process.environment = env
+    // MARK: - the two jobs
 
-        let events = Pipe(), stdout = Pipe()
-        process.standardError = events
-        process.standardOutput = stdout
-        process.standardInput = FileHandle.nullDevice
-
-        // stderr streams, because that's the live progress. stdout deliberately
-        // does not: it carries one line — the finished path — and reading it only
-        // after the process exits is the difference between a deterministic read
-        // and racing a readability callback against the termination handler.
-        // (One path line can't come close to filling the pipe buffer.)
-        events.fileHandleForReading.readabilityHandler = { [weak self] handle in
-            self?.consume(handle.availableData)
+    private func renderStill() -> Result<URL, RenderError> {
+        guard let palette = PaletteSpec.named[paletteName] else {
+            return .failure(RenderError(message: "Unknown palette “\(paletteName)”."))
         }
-        process.terminationHandler = { [weak self] proc in
-            events.fileHandleForReading.readabilityHandler = nil
-            let tailErr = events.fileHandleForReading.readDataToEndOfFile()
-            let tailOut = stdout.fileHandleForReading.readDataToEndOfFile()
-            self?.consume(tailErr)
-            DispatchQueue.main.async {
-                self?.output.append(tailOut)
-                self?.complete(status: proc.terminationStatus)
+        guard let buffer = Renderer.render(
+            width: size.w, height: size.h, seed: seed, palette: palette,
+            sharp: 0.6, glow: 0.7, softness: 1.0,
+            onProgress: { [self] pct, buf in report(Double(pct), "painting", buf) },
+            isCancelled: { [self] in cancelled.value })
+        else { return .failure(.cancelled) }
+
+        report(100, "writing PNG", nil)
+        let url = Gallery.folder.appendingPathComponent("\(paletteName)-\(seed).png")
+        guard ensureGallery(), ImageWriter.writePNG(buffer, width: size.w, height: size.h, to: url) else {
+            return .failure(RenderError(message: "Couldn’t write \(url.lastPathComponent)."))
+        }
+        return .success(url)
+    }
+
+    private func renderDayCycle() -> Result<URL, RenderError> {
+        // The schedule depends only on the time of day, so it's known before any
+        // pixels exist — which lets frames stream straight out to disk.
+        let looks = (0..<frames).map { dayLook(Double($0) / Double(frames)) }
+        let times = (0..<frames).map { Double($0) / Double(frames) }
+        let brightness = looks.map { $0.palette.background.reduce(0, +) }
+        let lightIndex = brightness.firstIndex(of: brightness.max()!)!
+        let darkIndex = brightness.firstIndex(of: brightness.min()!)!
+
+        let url = Gallery.folder.appendingPathComponent("day-\(seed).heic")
+        guard ensureGallery(),
+              let writer = ImageWriter.DynamicHEIC(
+                url: url, frameCount: frames, times: times,
+                lightIndex: lightIndex, darkIndex: darkIndex, quality: 0.86)
+        else { return .failure(RenderError(message: "Couldn’t start writing \(url.lastPathComponent).")) }
+
+        for (i, look) in looks.enumerated() {
+            let base = Double(i) * 100.0 / Double(frames)
+            let span = 100.0 / Double(frames)
+            guard let buffer = Renderer.render(
+                width: size.w, height: size.h, seed: seed, palette: look.palette,
+                sharp: 0.6, glow: look.glow, softness: look.softness,
+                onProgress: { [self] pct, buf in
+                    report(base + span * Double(pct) / 100.0, "frame \(i + 1)/\(frames)", buf)
+                },
+                isCancelled: { [self] in cancelled.value })
+            else {
+                try? FileManager.default.removeItem(at: url)
+                return .failure(.cancelled)
+            }
+            guard writer.add(buffer, width: size.w, height: size.h) else {
+                return .failure(RenderError(message: "Couldn’t encode frame \(i + 1)."))
             }
         }
-
-        try process.run()
+        report(100, "packing dynamic wallpaper", nil)
+        guard writer.finish() else {
+            return .failure(RenderError(message: "Couldn’t finish \(url.lastPathComponent)."))
+        }
+        return .success(url)
     }
 
-    func cancel() {
-        guard process.isRunning else { return }
-        cancelled = true
-        process.terminate()
+    // MARK: - progress and preview
+
+    private func ensureGallery() -> Bool {
+        (try? FileManager.default.createDirectory(at: Gallery.folder,
+                                                  withIntermediateDirectories: true)) != nil
     }
 
-    // MARK: - event stream
-
-    /// Called off the main thread; splits the stream into whole lines and hands
-    /// each parsed event back on the main queue. Anything that isn't an event is
-    /// kept as diagnostics, since that's where a Python traceback shows up.
-    private func consume(_ data: Data) {
-        guard !data.isEmpty else { return }
-        lock.lock()
-        pending.append(data)
-        var lines: [String] = []
-        while let newline = pending.firstIndex(of: 0x0A) {
-            let line = pending[pending.startIndex..<newline]
-            pending = Data(pending[pending.index(after: newline)...])
-            if let text = String(data: line, encoding: .utf8) { lines.append(text) }
+    /// Called from the render thread. The preview is throttled and downscaled
+    /// here so the main queue only ever receives a small finished image.
+    private func report(_ percent: Double, _ phase: String, _ buffer: [UInt8]?) {
+        let status = "\(summary) · \(phase) · \(Int(percent))%"
+        var image: NSImage?
+        if let buffer, Date().timeIntervalSince(lastPreview) >= 0.7 {
+            lastPreview = Date()
+            image = Self.preview(buffer, width: size.w, height: size.h, maxWidth: previewWidth)
         }
-        var noise: [String] = []
-        var events: [RenderEvent] = []
-        for line in lines {
-            guard let event = RenderEvent(line: line) else { noise.append(line); continue }
-            events.append(event)
-            // The start and done events both name the destination, so the result
-            // doesn't hang on stdout arriving. ("preview" names a snapshot, not it.)
-            if event.phase == "start" || event.phase == "done" { announcedPath = event.path }
+        DispatchQueue.main.async { [self] in
+            onProgress?(percent, status)
+            if let image { onPreview?(image) }
         }
-        diagnostics.append(contentsOf: noise)
-        lock.unlock()
+    }
 
-        for event in events {
-            if event.phase == "preview" {
-                // Decode off the main thread — it happens once a second.
-                let image = Self.loadImage(previewURL)
-                DispatchQueue.main.async { image.map { self.onPreview?($0) } }
-            } else {
-                DispatchQueue.main.async { self.onEvent?(event) }
+    /// Nearest-neighbour downscale straight out of the render buffer — cheap
+    /// enough to run mid-paint, which a full-size CGImage would not be.
+    private static func preview(_ buffer: [UInt8], width w: Int, height h: Int,
+                                maxWidth: Int) -> NSImage? {
+        let dw = min(w, maxWidth)
+        let dh = max(1, h * dw / w)
+        var out = [UInt8](repeating: 0, count: dw * dh * 3)
+        let xs = (0..<dw).map { ($0 * w / dw) * 3 }
+        for y in 0..<dh {
+            let src = (y * h / dh) * w * 3
+            let dst = y * dw * 3
+            for x in 0..<dw {
+                let s = src + xs[x], d = dst + x * 3
+                out[d] = buffer[s]; out[d + 1] = buffer[s + 1]; out[d + 2] = buffer[s + 2]
             }
         }
+        guard let cg = ImageWriter.makeImage(out, width: dw, height: dh) else { return nil }
+        return NSImage(cgImage: cg, size: NSSize(width: dw, height: dh))
     }
+}
 
-    /// Read through Data rather than NSImage(contentsOf:), which caches by path —
-    /// every snapshot lands at the same path, so a cached read would freeze the
-    /// preview on the first frame.
-    private static func loadImage(_ url: URL) -> NSImage? {
-        guard let data = try? Data(contentsOf: url) else { return nil }
-        return NSImage(data: data)
-    }
+extension RenderError {
+    /// Cancellation isn't worth an alert; the UI checks for it.
+    static let cancelled = RenderError(message: "")
+}
 
-    private func complete(status: Int32) {
-        guard !finished else { return }
-        finished = true
-        try? FileManager.default.removeItem(at: previewURL)
-        // The callbacks capture this job; drop them once it's over so it can go.
-        defer { onEvent = nil; onPreview = nil; onFinish = nil }
-
-        if cancelled {
-            onFinish?(.failure(RenderError(message: "")))
-            return
+extension NSLock {
+    /// A tiny lock-guarded Bool, for the cancel flag the render loop polls.
+    final class Flag {
+        private let lock = NSLock()
+        private var stored = false
+        var value: Bool {
+            get { lock.lock(); defer { lock.unlock() }; return stored }
+            set { lock.lock(); stored = newValue; lock.unlock() }
         }
-        lock.lock()
-        let announced = announcedPath
-        let detail = diagnostics.suffix(12).joined(separator: "\n")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        lock.unlock()
-
-        let text = String(data: output, encoding: .utf8) ?? ""
-        let printed = text.split(separator: "\n").last { $0.hasPrefix("/") }.map(String.init)
-        let path = [printed, announced].compactMap { $0 }
-            .first { FileManager.default.fileExists(atPath: $0) }
-
-        guard status == 0, let path else {
-            onFinish?(.failure(RenderError(message: detail.isEmpty
-                ? "The renderer exited with status \(status)."
-                : detail)))
-            return
-        }
-        onFinish?(.success(URL(fileURLWithPath: path)))
     }
 }
