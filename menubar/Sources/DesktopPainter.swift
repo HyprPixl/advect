@@ -9,9 +9,12 @@ import UniformTypeIdentifiers
 /// Three measurements shaped this. PNG encoding a native-resolution frame takes
 /// 239 ms, which rules it out entirely; JPEG at half resolution takes 6 ms and
 /// macOS scales it up to fill anyway. `setDesktopImageURL` is only ~0.8 ms, far
-/// cheaper than expected. And each frame goes to its own filename, because
-/// re-setting a path whose contents changed is exactly the case a wallpaper
-/// cache is entitled to ignore.
+/// cheaper than expected.
+///
+/// Consecutive frames always go to *different* paths, because re-setting the
+/// same path with changed contents is exactly the case a wallpaper cache is
+/// entitled to ignore. They cycle through a fixed ring of slots rather than
+/// each taking a fresh name — see `slotCount`.
 ///
 /// Whatever was on the desktop before is remembered, so a cancelled render puts
 /// it back rather than leaving a half-painted picture up.
@@ -22,7 +25,6 @@ final class DesktopPainter {
     private let interval: TimeInterval
     private var lastPaint = Date.distantPast
     private var counter = 0
-    private var written: [URL] = []          // only touched on `queue`
     private let queue = DispatchQueue(label: "advect.desktop-painter")
     private let inFlight = NSLock.Flag()
 
@@ -66,24 +68,44 @@ final class DesktopPainter {
 
         let (small, sw, sh) = Self.downscale(buffer, width: w, height: h, maxWidth: width)
         counter += 1
-        let url = directory.appendingPathComponent("frame-\(counter).jpg")
+        let slot = directory.appendingPathComponent("slot-\(counter % Self.slotCount).jpg")
+        let scratch = directory.appendingPathComponent("scratch-\(counter).jpg")
 
         queue.async { [self] in
             defer { inFlight.value = false }
             guard let image = ImageWriter.makeImage(small, width: sw, height: sh),
                   let dest = CGImageDestinationCreateWithURL(
-                    url as CFURL, UTType.jpeg.identifier as CFString, 1, nil)
+                    scratch as CFURL, UTType.jpeg.identifier as CFString, 1, nil)
             else { return }
             CGImageDestinationAddImage(
                 dest, image, [kCGImageDestinationLossyCompressionQuality: 0.7] as CFDictionary)
             guard CGImageDestinationFinalize(dest) else { return }
-            Self.setDesktop(url)
+            guard Self.replace(scratch, with: slot) else { return }
+            Self.setDesktop(slot)
+        }
+    }
 
-            // Keep only a couple of frames on disk; at 10 Hz this would
-            // otherwise leave tens of megabytes behind over one render.
-            written.append(url)
-            while written.count > 2 {
-                try? FileManager.default.removeItem(at: written.removeFirst())
+    /// A fixed ring of filenames, cycled through and overwritten in place.
+    ///
+    /// Nothing is deleted while a render is running, and that is the whole
+    /// point. macOS reads a wallpaper asynchronously and can lag several frames
+    /// behind; deleting a file it is about to read drops it to the stock system
+    /// wallpaper, which is glaringly visible. Overwriting a slot instead means
+    /// every path ever handed to macOS still exists — the worst case is that it
+    /// reads a slightly stale frame, which is invisible at ten a second.
+    ///
+    /// The ring also bounds disk use at roughly 6 MB no matter how long the
+    /// render runs, which matters for a 32-frame day cycle.
+    private static let slotCount = 16
+
+    /// rename(2): atomic, and it replaces an existing destination rather than
+    /// failing like FileManager.moveItem. So a slot is never absent and never
+    /// half-written, even if macOS reads it at the wrong moment.
+    private static func replace(_ source: URL, with destination: URL) -> Bool {
+        source.withUnsafeFileSystemRepresentation { s in
+            destination.withUnsafeFileSystemRepresentation { d in
+                guard let s, let d else { return false }
+                return rename(s, d) == 0
             }
         }
     }
@@ -95,27 +117,25 @@ final class DesktopPainter {
         releaseAfterHandover()
     }
 
-    /// Drains the queue, then removes the temp frames.
+    /// Remove every temp frame.
     ///
-    /// The most recent frame is kept unless `includingCurrent` says otherwise,
-    /// because it is very likely still the desktop picture — and deleting the
-    /// file macOS is currently displaying makes it fall back to the stock
-    /// system wallpaper, which flashes up unmistakably.
-    func cleanUp(includingCurrent: Bool = false) {
+    /// Only ever called after the real wallpaper has been set and given time to
+    /// land — never while a render is running, because a file macOS is still
+    /// referencing must not disappear.
+    private func purge() {
         queue.sync {
-            let removable = includingCurrent ? written : written.dropLast()
-            for url in removable { try? FileManager.default.removeItem(at: url) }
-            written = includingCurrent ? [] : Array(written.suffix(1))
+            let fm = FileManager.default
+            let leftovers = (try? fm.contentsOfDirectory(at: directory,
+                                                         includingPropertiesForKeys: nil)) ?? []
+            for url in leftovers { try? fm.removeItem(at: url) }
         }
     }
 
-    /// Call once the real wallpaper has been set, to drop the last temp frame.
-    /// Delayed because `setDesktopImageURL` returns before macOS has finished
-    /// reading the file it was handed.
-    func releaseAfterHandover(delay: TimeInterval = 3) {
-        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [self] in
-            cleanUp(includingCurrent: true)
-        }
+    /// Call once the real wallpaper has been set. The delay is not politeness:
+    /// setDesktopImageURL returns before macOS has finished reading the file it
+    /// was handed, and the agent lags further behind still.
+    func releaseAfterHandover(delay: TimeInterval = 5) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [self] in purge() }
     }
 
     private static func setDesktop(_ url: URL) {

@@ -75,7 +75,7 @@ final class RenderJob {
             // Either way the frame currently on screen survives until the
             // handover completes — deleting it early drops macOS back to its
             // stock wallpaper for a moment.
-            if case .failure = result, isCancelled { desktop?.restore() } else { desktop?.cleanUp() }
+            if case .failure = result, isCancelled { desktop?.restore() }
             DispatchQueue.main.async { [self] in
                 onFinish?(result)               // the caller sets the real wallpaper here
                 desktop?.releaseAfterHandover()
