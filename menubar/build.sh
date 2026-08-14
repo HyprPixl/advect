@@ -110,7 +110,10 @@ if [ "$notarize" = 1 ]; then
         echo "  Developer ID Application. Then re-run, or set SIGN_ID." >&2
         exit 1
     fi
-    echo "signing as $sign_id…"
+    # Braced deliberately: bash 3.2 (what macOS ships) isn't UTF-8 aware when it
+    # parses an identifier, and reads the first byte of the following "…" as part
+    # of the variable name.
+    echo "signing as ${sign_id}…"
     # Hardened runtime and a secure timestamp are both prerequisites for
     # notarization; the app spawns python3 as a child process, which the
     # hardened runtime permits without any extra entitlement.
