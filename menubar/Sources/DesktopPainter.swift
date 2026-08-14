@@ -11,10 +11,17 @@ import UniformTypeIdentifiers
 /// macOS scales it up to fill anyway. `setDesktopImageURL` is only ~0.8 ms, far
 /// cheaper than expected.
 ///
-/// Consecutive frames always go to *different* paths, because re-setting the
-/// same path with changed contents is exactly the case a wallpaper cache is
-/// entitled to ignore. They cycle through a fixed ring of slots rather than
-/// each taking a fresh name — see `slotCount`.
+/// Frame files are unique and short-lived, and both halves of that matter,
+/// because the two ways this goes wrong pull in opposite directions:
+///
+///   * delete a frame too soon and macOS, which reads wallpapers
+///     asynchronously and lags, finds the file gone and drops to the stock
+///     system wallpaper — a very visible flash
+///   * reuse a path and macOS serves its *cached* image for that path rather
+///     than re-reading it, so the desktop snaps back to an older frame
+///
+/// So: every frame gets its own name, and names are retired only after a long
+/// grace period. See `windowFrames`.
 ///
 /// Whatever was on the desktop before is remembered, so a cancelled render puts
 /// it back rather than leaving a half-painted picture up.
@@ -27,6 +34,7 @@ final class DesktopPainter {
     private var counter = 0
     private let queue = DispatchQueue(label: "advect.desktop-painter")
     private let inFlight = NSLock.Flag()
+    private var live: [URL] = []            // only touched on `queue`
 
     /// - Parameter interval: minimum seconds between desktop updates. At ~9 ms a
     ///   frame, 0.1 costs about 9% of a render.
@@ -68,7 +76,7 @@ final class DesktopPainter {
 
         let (small, sw, sh) = Self.downscale(buffer, width: w, height: h, maxWidth: width)
         counter += 1
-        let slot = directory.appendingPathComponent("slot-\(counter % Self.slotCount).jpg")
+        let frame = directory.appendingPathComponent("frame-\(counter).jpg")
         let scratch = directory.appendingPathComponent("scratch-\(counter).jpg")
 
         queue.async { [self] in
@@ -80,26 +88,28 @@ final class DesktopPainter {
             CGImageDestinationAddImage(
                 dest, image, [kCGImageDestinationLossyCompressionQuality: 0.7] as CFDictionary)
             guard CGImageDestinationFinalize(dest) else { return }
-            guard Self.replace(scratch, with: slot) else { return }
-            Self.setDesktop(slot)
+            guard Self.replace(scratch, with: frame) else { return }
+            Self.setDesktop(frame)
+
+            // Retire old frames far enough behind that macOS is long done with
+            // them. The previous version kept two — about 200 ms — and that was
+            // nowhere near enough.
+            live.append(frame)
+            while live.count > Self.windowFrames {
+                try? FileManager.default.removeItem(at: live.removeFirst())
+            }
         }
     }
 
-    /// A fixed ring of filenames, cycled through and overwritten in place.
-    ///
-    /// Nothing is deleted while a render is running, and that is the whole
-    /// point. macOS reads a wallpaper asynchronously and can lag several frames
-    /// behind; deleting a file it is about to read drops it to the stock system
-    /// wallpaper, which is glaringly visible. Overwriting a slot instead means
-    /// every path ever handed to macOS still exists — the worst case is that it
-    /// reads a slightly stale frame, which is invisible at ten a second.
-    ///
-    /// The ring also bounds disk use at roughly 6 MB no matter how long the
-    /// render runs, which matters for a 32-frame day cycle.
-    private static let slotCount = 16
+    /// How many frames stay on disk behind the current one — about six seconds
+    /// of grace at ten a second. macOS only needs a fraction of that, but the
+    /// cost of being wrong is a stock-wallpaper flash, and the cost of being
+    /// generous is a few megabytes of temp files. Bounds disk at roughly 25 MB
+    /// however long the render runs, which matters for a 32-frame day cycle.
+    private static let windowFrames = 60
 
     /// rename(2): atomic, and it replaces an existing destination rather than
-    /// failing like FileManager.moveItem. So a slot is never absent and never
+    /// failing like FileManager.moveItem. So a frame is never absent and never
     /// half-written, even if macOS reads it at the wrong moment.
     private static func replace(_ source: URL, with destination: URL) -> Bool {
         source.withUnsafeFileSystemRepresentation { s in
