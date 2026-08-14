@@ -4,6 +4,7 @@
 #   ./build.sh              build into menubar/build/Advect.app (ad-hoc signed)
 #   ./build.sh --install    build, then move it into ~/Applications and launch it
 #   ./build.sh --notarize   sign with a Developer ID, notarize, and staple
+#   ./build.sh --dmg        additionally wrap it in a signed, notarized .dmg
 #
 # No Xcode project and no package manager: swiftc compiles the sources straight
 # into a hand-laid bundle, with the renderer and the C march compiled in. The
@@ -46,10 +47,12 @@ contents="$app/Contents"
 
 install=0
 notarize=0
+dmg=0
 for arg in "$@"; do
     case "$arg" in
         --install) install=1 ;;
         --notarize) notarize=1 ;;
+        --dmg) notarize=1; dmg=1 ;;
         *) echo "unknown option: $arg" >&2; exit 2 ;;
     esac
 done
@@ -57,19 +60,25 @@ done
 rm -rf "$app"
 mkdir -p "$contents/MacOS" "$contents/Resources"
 
-echo "compiling the C march…"
-cc -O3 -target arm64-apple-macos13.0 -c "$repo/advect_accel.c" -o "$build/advect_accel.o"
-
-echo "compiling…"
-# The renderer is compiled *into* the binary — no interpreter, no scripts in
-# Resources, nothing to find at run time. The app works on a stock Mac.
-swiftc -O \
-    -target arm64-apple-macos13.0 \
-    -framework AppKit -framework ServiceManagement -framework ImageIO \
-    -import-objc-header "$here/Sources/Render/advect_accel.h" \
-    -o "$contents/MacOS/Advect" \
-    "$here"/Sources/*.swift "$here"/Sources/Render/*.swift \
-    "$build/advect_accel.o"
+# Universal, so the download runs on Intel Macs too and not just the machine
+# that happened to build it. The renderer is compiled *into* the binary — no
+# interpreter, no scripts in Resources, nothing to find at run time.
+slices=""
+for arch in arm64 x86_64; do
+    echo "compiling ($arch)…"
+    cc -O3 -target "$arch-apple-macos13.0" -c "$repo/advect_accel.c" \
+        -o "$build/advect_accel-$arch.o"
+    swiftc -O \
+        -target "$arch-apple-macos13.0" \
+        -framework AppKit -framework ServiceManagement -framework ImageIO \
+        -import-objc-header "$here/Sources/Render/advect_accel.h" \
+        -o "$build/Advect-$arch" \
+        "$here"/Sources/*.swift "$here"/Sources/Render/*.swift \
+        "$build/advect_accel-$arch.o"
+    slices="$slices $build/Advect-$arch"
+done
+lipo -create $slices -output "$contents/MacOS/Advect"
+rm -f $slices "$build"/advect_accel-*.o
 
 cp "$here/Resources/Info.plist" "$contents/Info.plist"
 
@@ -141,6 +150,34 @@ if [ "$notarize" = 1 ]; then
     rm -f "$zip"
     echo "=== Gatekeeper assessment ==="
     spctl --assess --type execute --verbose=4 "$app"
+fi
+
+if [ "$dmg" = 1 ]; then
+    version="$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' "$contents/Info.plist")"
+    image="$build/Advect-$version.dmg"
+    stage="$build/dmg"
+    rm -rf "$stage" "$image"
+    mkdir -p "$stage"
+    cp -R "$app" "$stage/"
+    # The customary drag-to-install target.
+    ln -s /Applications "$stage/Applications"
+
+    echo "building $(basename "$image")…"
+    hdiutil create -volname "Advect" -srcfolder "$stage" -ov -quiet \
+        -format UDZO -imagekey zlib-level=9 "$image"
+    rm -rf "$stage"
+
+    # The disk image is what actually gets downloaded, so it needs its own
+    # signature and its own notarization — the app's ticket inside doesn't
+    # vouch for the container.
+    codesign --force --timestamp --sign "$sign_id" "$image"
+    echo "notarizing the disk image…"
+    xcrun notarytool submit "$image" --keychain-profile "$profile" --wait
+    xcrun stapler staple "$image"
+
+    echo "=== disk image assessment ==="
+    spctl --assess --type open --context context:primary-signature --verbose=4 "$image"
+    ls -lh "$image" | awk '{print "  " $9 "  " $5}'
 fi
 
 if [ "$install" = 1 ]; then
