@@ -70,7 +70,11 @@ final class Settings {
             "quality": Quality.native.rawValue,
             "rotate": Rotate.off.rawValue,
             "frames": 32,
-            "showPreview": true,
+            // The desktop is the better preview: it's the actual size, the
+            // actual thing. The panel stays available for anyone who'd rather
+            // not have their wallpaper move while it works.
+            "showPreview": false,
+            "paintOnDesktop": true,
         ])
     }
 
@@ -101,9 +105,9 @@ final class Settings {
         set { store.set(newValue, forKey: "showPreview") }
     }
 
-    /// Paint onto the desktop itself as it renders, rather than only into the
-    /// panel. Costs roughly 9% of a render and churns the wallpaper; off by
-    /// default because it's a spectacle, not a default behaviour.
+    /// Paint onto the desktop itself as it renders. Costs roughly 7% of a
+    /// render; on by default, because watching the wallpaper draw itself at
+    /// full size is better than watching a thumbnail of it.
     var paintOnDesktop: Bool {
         get { store.bool(forKey: "paintOnDesktop") }
         set { store.set(newValue, forKey: "paintOnDesktop") }
