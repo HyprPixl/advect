@@ -27,12 +27,15 @@ final class RenderJob {
     private let cancelled = NSLock.Flag()
     private var lastPreview = Date.distantPast
 
-    /// The panel is 420pt wide, so this is its backing resolution on a Retina
-    /// display — anything less gets stretched back up and looks soft. It's also
-    /// *cheaper* than a smaller preview: sampling every 4th pixel out of the
-    /// render buffer reads more sequentially than every 5th, and the downscale
-    /// is memory-bound. Measured at 0.48 ms against 0.77 ms for 640px.
-    private let previewWidth = 840
+    /// Exactly the panel's backing width: 420pt at the display's scale factor.
+    /// Less than this gets stretched back up and looks soft; more is wasted.
+    ///
+    /// Cost is linear in output pixels — 0.10 ms at 420px, 0.39 ms at 840,
+    /// 0.89 ms at 1280 — so a smaller preview genuinely is cheaper. It just
+    /// isn't cheaper by an amount worth having: at the rate below, 840px comes
+    /// to about 1.5% of a render, against 0.4% for 420px. Spend the 1% on a
+    /// preview that's actually in focus.
+    private let previewWidth = Int(420 * (NSScreen.main?.backingScaleFactor ?? 2))
 
     /// Cap on preview rate. At native size the march yields roughly this often
     /// anyway; the cap only matters for small renders, where 48 chunks can
