@@ -1,12 +1,14 @@
 import AppKit
 import Foundation
 
-enum Palette: String, CaseIterable {
-    case random, harbor, ember, moss, dune
+/// A palette the user built in the editor. Stored beside the built-ins rather
+/// than in them, so `PaletteSpec.named` stays the fixed set the renderer ships.
+struct CustomPalette: Codable {
+    var name: String
+    var background: [Int]        // r, g, b
+    var strokes: [[Int]]         // four r,g,b triples
 
-    var title: String { self == .random ? "Random" : rawValue.capitalized }
-    /// nil means "let the renderer pick one", which is what --palette omitted does.
-    var flag: String? { self == .random ? nil : rawValue }
+    var spec: PaletteSpec { PaletteSpec(background: background, strokes: strokes) }
 }
 
 /// Render size, as a fraction of the display's native pixel size. Native looks
@@ -66,7 +68,7 @@ final class Settings {
 
     private init() {
         store.register(defaults: [
-            "palette": Palette.random.rawValue,
+            "palette": Settings.randomPalette,
             "quality": Quality.native.rawValue,
             "rotate": Rotate.off.rawValue,
             "frames": 32,
@@ -78,9 +80,35 @@ final class Settings {
         ])
     }
 
-    var palette: Palette {
-        get { Palette(rawValue: store.string(forKey: "palette") ?? "") ?? .random }
-        set { store.set(newValue.rawValue, forKey: "palette") }
+    /// The name stored when the palette is left up to the renderer. It can't
+    /// collide with a real one: the editor refuses it as a custom name.
+    static let randomPalette = "random"
+
+    /// A palette name — a built-in, one of the user's own, or `randomPalette`.
+    var palette: String {
+        get { store.string(forKey: "palette") ?? Settings.randomPalette }
+        set { store.set(newValue, forKey: "palette") }
+    }
+
+    /// The user's palettes, JSON in UserDefaults. A decode failure means the key
+    /// holds something we didn't write, and an empty list is the honest answer.
+    var customPalettes: [CustomPalette] {
+        get {
+            guard let data = store.data(forKey: "customPalettes"),
+                  let list = try? JSONDecoder().decode([CustomPalette].self, from: data)
+            else { return [] }
+            return list
+        }
+        set { store.set(try? JSONEncoder().encode(newValue), forKey: "customPalettes") }
+    }
+
+    /// Every palette that can be rendered, built-ins first, in menu order.
+    var paletteNames: [String] { PaletteSpec.order + customPalettes.map(\.name) }
+
+    /// The one lookup everything renders through: a custom palette shadows
+    /// nothing, but is found by name exactly the way a built-in is.
+    func paletteSpec(named name: String) -> PaletteSpec? {
+        PaletteSpec.named[name] ?? customPalettes.first { $0.name == name }?.spec
     }
 
     var quality: Quality {

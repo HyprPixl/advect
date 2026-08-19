@@ -35,6 +35,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSWorkspace.shared.notificationCenter.addObserver(
             self, selector: #selector(didWake),
             name: NSWorkspace.didWakeNotification, object: nil)
+
+        PaletteEditorWindow.shared.onGenerate = { [weak self] name in
+            guard let self else { return }
+            self.settings.palette = name
+            self.render(kind: .still, setWhenDone: true)
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -114,13 +120,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func paletteMenu() -> NSMenu {
         let sub = NSMenu()
-        for palette in Palette.allCases {
-            let item = sub.addItem(withTitle: palette.title, action: #selector(pickPalette(_:)), keyEquivalent: "")
+        let custom = settings.customPalettes.map(\.name)
+        for name in [Settings.randomPalette] + settings.paletteNames {
+            // Built-in names are lowercase words; a custom one is shown as typed.
+            let title = custom.contains(name) ? name : name.capitalized
+            let item = sub.addItem(withTitle: title, action: #selector(pickPalette(_:)),
+                                   keyEquivalent: "")
             item.target = self
-            item.representedObject = palette.rawValue
-            item.state = settings.palette == palette ? .on : .off
-            if palette == .random { sub.addItem(.separator()) }
+            item.representedObject = name
+            item.state = settings.palette == name ? .on : .off
+            // Separators mark the three groups: random, built-ins, the user's own.
+            if name == Settings.randomPalette { sub.addItem(.separator()) }
+            if name == PaletteSpec.order.last, !custom.isEmpty { sub.addItem(.separator()) }
         }
+        sub.addItem(.separator())
+        sub.addItem(withTitle: "Palette Editor…", action: #selector(openPaletteEditor), keyEquivalent: "")
+            .target = self
         return sub
     }
 
@@ -161,7 +176,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func recentMenu() -> NSMenu {
         let sub = NSMenu()
-        let files = Gallery.recent(limit: 12)
+        let files = Gallery.recent(limit: 5)
         if files.isEmpty {
             sub.addItem(withTitle: "Nothing rendered yet", action: nil, keyEquivalent: "").isEnabled = false
             return sub
@@ -197,7 +212,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: - settings actions
 
     @objc private func pickPalette(_ sender: NSMenuItem) {
-        settings.palette = Palette(rawValue: sender.representedObject as? String ?? "") ?? .random
+        settings.palette = sender.representedObject as? String ?? Settings.randomPalette
+    }
+
+    @objc private func openPaletteEditor() {
+        PaletteEditorWindow.shared.present()
     }
 
     @objc private func pickQuality(_ sender: NSMenuItem) {

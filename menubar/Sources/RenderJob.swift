@@ -22,6 +22,9 @@ final class RenderJob {
     var onPreview: ((NSImage) -> Void)?
     var onFinish: ((Result<URL, RenderError>) -> Void)?
 
+    /// Resolved once, up front: a custom palette edited mid-render shouldn't
+    /// change the colours halfway through the frames it's already painting.
+    private let paletteSpec: PaletteSpec?
     private let size: (w: Int, h: Int)
     private let frames: Int
     private let cancelled = NSLock.Flag()
@@ -49,8 +52,11 @@ final class RenderJob {
         self.seed = Int.random(in: 0..<(1 << 20))
         self.size = settings.quality.size
         self.frames = settings.frames
-        let chosen = settings.palette.flag ?? PaletteSpec.order.randomElement()!
+        let chosen = settings.palette == Settings.randomPalette
+            ? settings.paletteNames.randomElement()!
+            : settings.palette
         self.paletteName = chosen
+        self.paletteSpec = settings.paletteSpec(named: chosen)
         self.desktop = settings.paintOnDesktop ? DesktopPainter() : nil
     }
 
@@ -86,7 +92,7 @@ final class RenderJob {
     // MARK: - the two jobs
 
     private func renderStill() -> Result<URL, RenderError> {
-        guard let palette = PaletteSpec.named[paletteName] else {
+        guard let palette = paletteSpec else {
             return .failure(RenderError(message: "Unknown palette “\(paletteName)”."))
         }
         guard let buffer = Renderer.render(
@@ -101,6 +107,7 @@ final class RenderJob {
         guard ensureGallery(), ImageWriter.writePNG(buffer, width: size.w, height: size.h, to: url) else {
             return .failure(RenderError(message: "Couldn’t write \(url.lastPathComponent)."))
         }
+        Gallery.prune(keep: 5)
         return .success(url)
     }
 
@@ -147,6 +154,7 @@ final class RenderJob {
         guard writer.finish() else {
             return .failure(RenderError(message: "Couldn’t finish \(url.lastPathComponent)."))
         }
+        Gallery.prune(keep: 5)
         return .success(url)
     }
 

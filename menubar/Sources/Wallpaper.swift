@@ -55,6 +55,13 @@ enum Gallery {
             .map(\.0)
     }
 
+    /// Delete everything past the newest `keep` renders, so the gallery never
+    /// grows unbounded. Called after a successful render.
+    static func prune(keep: Int) {
+        let stale = recent(limit: .max).dropFirst(keep)
+        for url in stale { try? FileManager.default.removeItem(at: url) }
+    }
+
     private static var thumbnails: [String: NSImage] = [:]
 
     /// A small thumbnail, cached by path and mtime. Uses ImageIO so a 150 MB
