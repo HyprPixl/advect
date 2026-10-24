@@ -18,8 +18,12 @@ enum ImageWriter {
     }
 
     static func writePNG(_ buffer: [UInt8], width w: Int, height h: Int, to url: URL) -> Bool {
-        guard let image = makeImage(buffer, width: w, height: h),
-              let dest = CGImageDestinationCreateWithURL(url as CFURL, UTType.png.identifier as CFString, 1, nil)
+        guard let image = makeImage(buffer, width: w, height: h) else { return false }
+        return writePNG(image, to: url)
+    }
+
+    static func writePNG(_ image: CGImage, to url: URL) -> Bool {
+        guard let dest = CGImageDestinationCreateWithURL(url as CFURL, UTType.png.identifier as CFString, 1, nil)
         else { return false }
         CGImageDestinationAddImage(dest, image, nil)
         return CGImageDestinationFinalize(dest)

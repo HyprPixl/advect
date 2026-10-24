@@ -29,7 +29,9 @@ final class RenderJob {
     private let frames: Int
     private let cancelled = NSLock.Flag()
     private var lastPreview = Date.distantPast
-    private let desktop: DesktopPainter?
+    private let desktop: DesktopPreview?
+    /// Set when this render covers the whole display arrangement.
+    private let span: SpanLayout?
 
     /// Exactly the panel's backing width: 420pt at the display's scale factor.
     /// Less than this gets stretched back up and looks soft; more is wasted.
@@ -50,19 +52,22 @@ final class RenderJob {
     init(kind: Kind, settings: Settings = .shared) {
         self.kind = kind
         self.seed = Int.random(in: 0..<(1 << 20))
-        self.size = settings.quality.size
+        self.span = kind == .still && settings.spanDisplays
+            ? SpanLayout.current(divisor: settings.quality.divisor) : nil
+        self.size = span.map { ($0.width, $0.height) } ?? settings.quality.size
         self.frames = settings.frames
         let chosen = settings.palette == Settings.randomPalette
             ? settings.paletteNames.randomElement()!
             : settings.palette
         self.paletteName = chosen
         self.paletteSpec = settings.paletteSpec(named: chosen)
-        self.desktop = settings.paintOnDesktop ? DesktopPainter() : nil
+        self.desktop = settings.paintOnDesktop ? DesktopPreview(span: span) : nil
     }
 
     var summary: String {
         let what = kind == .dynamic ? "day cycle" : paletteName
-        return "\(what) · seed \(seed) · \(size.w)×\(size.h)"
+        let across = span.map { " · \($0.tiles.count) displays" } ?? ""
+        return "\(what)\(across) · seed \(seed) · \(size.w)×\(size.h)"
     }
 
     var isCancelled: Bool { cancelled.value }
@@ -76,15 +81,14 @@ final class RenderJob {
             case .still: result = renderStill()
             case .dynamic: result = renderDayCycle()
             }
-            // A finished render gets its real wallpaper set by the caller; a
-            // cancelled one has to put back what was on the desktop before.
-            // Either way the frame currently on screen survives until the
-            // handover completes — deleting it early drops macOS back to its
-            // stock wallpaper for a moment.
-            if case .failure = result, isCancelled { desktop?.restore() }
+            // A finished render gets its real wallpaper set by the caller. A
+            // cancelled one needs nothing put back: the preview never touched
+            // the wallpaper, so what's underneath it is still what was there
+            // before. Either way the preview stays up until the handover has
+            // had a moment to land — see DesktopPreview.dismiss.
             DispatchQueue.main.async { [self] in
                 onFinish?(result)               // the caller sets the real wallpaper here
-                desktop?.releaseAfterHandover()
+                desktop?.dismiss()
             }
         }
     }
@@ -103,9 +107,16 @@ final class RenderJob {
         else { return .failure(.cancelled) }
 
         report(100, "writing PNG", nil)
-        let url = Gallery.folder.appendingPathComponent("\(paletteName)-\(seed).png")
+        let name = span == nil ? "\(paletteName)-\(seed)" : "\(paletteName)-\(seed)-span"
+        let url = Gallery.folder.appendingPathComponent("\(name).png")
         guard ensureGallery(), ImageWriter.writePNG(buffer, width: size.w, height: size.h, to: url) else {
             return .failure(RenderError(message: "Couldn’t write \(url.lastPathComponent)."))
+        }
+        if let span {
+            report(100, "cutting \(span.tiles.count) tiles", nil)
+            guard writeTiles(buffer, span: span, canvas: url) else {
+                return .failure(RenderError(message: "Couldn’t write the tiles for \(url.lastPathComponent)."))
+            }
         }
         Gallery.prune(keep: 5)
         return .success(url)
@@ -156,6 +167,22 @@ final class RenderJob {
         }
         Gallery.prune(keep: 5)
         return .success(url)
+    }
+
+    /// One PNG per display, cut from the canvas. Each is exactly that display's
+    /// aspect, so macOS shows it edge to edge without cropping or letterboxing,
+    /// and the seams line up.
+    private func writeTiles(_ buffer: [UInt8], span: SpanLayout, canvas: URL) -> Bool {
+        let folder = Gallery.tilesFolder(of: canvas)
+        guard (try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)) != nil,
+              let image = ImageWriter.makeImage(buffer, width: size.w, height: size.h)
+        else { return false }
+        for tile in span.tiles {
+            guard let piece = image.cropping(to: tile.rect),
+                  ImageWriter.writePNG(piece, to: Gallery.tile(of: canvas, display: tile.display))
+            else { return false }
+        }
+        return true
     }
 
     // MARK: - progress and preview

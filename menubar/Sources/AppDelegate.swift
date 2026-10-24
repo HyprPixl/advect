@@ -36,6 +36,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self, selector: #selector(didWake),
             name: NSWorkspace.didWakeNotification, object: nil)
 
+        Wallpaper.adoptCurrent()
+        // A display attached later comes up showing whatever path it last had,
+        // which is often a render that has since been pruned — and a missing
+        // file means the stock system wallpaper, not ours.
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(screensChanged),
+            name: NSApplication.didChangeScreenParametersNotification, object: nil)
+
         PaletteEditorWindow.shared.onGenerate = { [weak self] name in
             guard let self else { return }
             self.settings.palette = name
@@ -62,6 +70,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func didWake() { rotateIfDue() }
 
+    @objc private func screensChanged() { Wallpaper.reassert() }
+
     // MARK: - menu
 
     func menuNeedsUpdate(_ menu: NSMenu) {
@@ -87,6 +97,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         dynamic.target = self
         dynamic.isEnabled = !rendering
         dynamic.toolTip = "Render a Dynamic .heic whose colour drifts with the time of day"
+
+        let span = menu.addItem(withTitle: "Span Displays", action: #selector(toggleSpan), keyEquivalent: "")
+        span.target = self
+        span.state = settings.spanDisplays ? .on : .off
+        span.isEnabled = NSScreen.screens.count > 1
+        span.toolTip = NSScreen.screens.count > 1
+            ? "Paint one wallpaper across all your displays, following their arrangement"
+            : "Needs more than one display"
 
         menu.addItem(.separator())
         menu.addItem(submenu: paletteMenu(), title: "Palette")
@@ -141,8 +159,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func qualityMenu() -> NSMenu {
         let sub = NSMenu()
+        let spanning = settings.spanDisplays
         for quality in Quality.allCases {
-            let size = quality.size
+            let size = (spanning ? SpanLayout.current(divisor: quality.divisor) : nil)
+                .map { (w: $0.width, h: $0.height) } ?? quality.size
             let item = sub.addItem(withTitle: "\(quality.title) — \(size.w)×\(size.h)",
                                    action: #selector(pickQuality(_:)), keyEquivalent: "")
             item.target = self
@@ -236,6 +256,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func togglePreview() {
         settings.showPreview.toggle()
         if !settings.showPreview { previewPanel.dismiss() }
+    }
+
+    @objc private func toggleSpan() {
+        settings.spanDisplays.toggle()
     }
 
     @objc private func togglePaintOnDesktop() {

@@ -24,6 +24,9 @@ From the menu bar you get:
 - **New Day Cycle** — a Dynamic `.heic` whose colour drifts with the time of day
 - **Auto-Rotate** — a fresh wallpaper every 30 minutes through once a day
 - **Recent** — thumbnails of past renders, click to re-apply, ⌥-click to reveal
+- **Span Displays** — one picture across all your monitors, laid out the way
+  they're arranged in System Settings, so a filament leaving one screen carries
+  on into the next
 - Palette, size and frame-count pickers, and **Launch at Login**
 
 While it paints, the wallpaper itself redraws about ten times a second, so you

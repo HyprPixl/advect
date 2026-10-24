@@ -77,6 +77,7 @@ final class Settings {
             // not have their wallpaper move while it works.
             "showPreview": false,
             "paintOnDesktop": true,
+            "spanDisplays": false,
         ])
     }
 
@@ -139,6 +140,14 @@ final class Settings {
     var paintOnDesktop: Bool {
         get { store.bool(forKey: "paintOnDesktop") }
         set { store.set(newValue, forKey: "paintOnDesktop") }
+    }
+
+    /// Render one picture across every display, laid out the way they're
+    /// arranged, instead of the same picture on each. Stills only: a day cycle
+    /// would mean one Dynamic .heic per display, each hundreds of megabytes.
+    var spanDisplays: Bool {
+        get { store.bool(forKey: "spanDisplays") }
+        set { store.set(newValue, forKey: "spanDisplays") }
     }
 
     /// When auto-rotate last fired, so quitting doesn't restart the clock.
